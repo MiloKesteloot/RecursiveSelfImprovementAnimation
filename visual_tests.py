@@ -42,7 +42,7 @@ import os
 import random
 
 import numpy as np
-from manim import DOWN, Circle, FadeIn, FadeOut, Group, LaggedStart, Scene, Text, VGroup, config
+from manim import DOWN, Circle, FadeIn, FadeOut, Group, ImageMobject, LaggedStart, Scene, Text, VGroup, config
 
 from recursive_self_improvement import (
     BACKGROUND_COLOR,
@@ -58,6 +58,7 @@ from recursive_self_improvement import (
     RED_PALETTE,
     TEAL_EDGE,
     TEAL_PALETTE,
+    _hex_to_rgb,
     build_net,
     make_backdrop,
 )
@@ -77,13 +78,52 @@ COLS_X = [-4.5, 0.0, 4.5]
 ROWS_Y = [2.1, -2.1]
 
 
-# --- Soft Bloom: one extra, big, very soft circle behind each node -------
+# --- Soft Bloom: a true blurred glow behind each node, not stacked rings -
+#
+# A stack of flat, low-opacity circles (what this used to be) always
+# shows a visible ring at every layer's radius, since alpha-compositing
+# discs is still a step function -- see make_glow_blob's own docstring
+# in recursive_self_improvement.py for the same reasoning. Only a real
+# per-pixel gradient, rendered as a raster image, reads as an actual
+# glow rather than a target/bullseye of rings. So each bloom here is a
+# small gaussian falloff rasterized once with numpy, same as
+# make_glow_blob's technique -- just one soft blob per node instead of
+# one shared image for the whole net. It's tracked to that node's live
+# (drifting) center every frame via its own updater rather than folded
+# into the node's own VGroup, since ImageMobject can't live inside a
+# VGroup (VGroup only accepts VMobjects) -- unlike the earlier, broken
+# attempt at this (scaling one shared image of the whole net's
+# silhouette, which desynced every node but the one nearest its center),
+# a separate per-node image tracked individually can't drift out of
+# alignment with the node it belongs to.
 
 
-def add_soft_bloom(node, radius, glow_color):
-    pos = node.get_center()
-    bloom = Circle(radius=radius * 7.0, stroke_width=0, fill_color=glow_color, fill_opacity=0.045).move_to(pos)
-    node.add_to_back(bloom)
+def make_glow_disc(span_radius, sigma_radius, color, peak_alpha):
+    resolution = 96
+    scale = resolution / (span_radius * 2)
+    cx = cy = resolution / 2
+    ys, xs = np.mgrid[0:resolution, 0:resolution]
+    dist = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
+    sigma_px = sigma_radius * scale
+    alpha = peak_alpha * np.exp(-(dist**2) / (2 * sigma_px**2))
+
+    rgba = np.zeros((resolution, resolution, 4), dtype=np.uint8)
+    rgba[..., 0:3] = _hex_to_rgb(color).astype(np.uint8)
+    rgba[..., 3] = np.clip(alpha, 0, 255).astype(np.uint8)
+
+    image = ImageMobject(rgba)
+    span = span_radius * 2
+    image.stretch_to_fit_width(span)
+    image.stretch_to_fit_height(span)
+    return image
+
+
+def add_soft_bloom(node, radius, glow_color, extras):
+    for span_mult, sigma_mult, peak_alpha in ((9.0, 3.2, 100), (5.0, 1.5, 190)):
+        disc = make_glow_disc(radius * span_mult, radius * sigma_mult, glow_color, peak_alpha)
+        disc.move_to(node.get_center())
+        disc.add_updater(lambda mob: mob.move_to(node.get_center()))
+        extras.add(disc)
 
 
 # --- Pulse Core: the halo ring breathes, the core stays steady -----------
@@ -182,14 +222,22 @@ def build_cell(center, seed, palette, edge_color, style):
         palette=palette,
         edge_color=edge_color,
     )
-    extras = VGroup()
+    extras = Group()
 
     if style == "baseline":
         pass
     elif style == "bloom":
-        glow.scale(1.35)
         for node in nodes:
-            add_soft_bloom(node, NODE_RADIUS, palette[2])
+            # Strip the node's own flat halo rings (outer, halo) -- with
+            # those still layered on top of the new blurred glow discs
+            # below, the node reads as double-glowing. Left with just
+            # mid/core, the node is a plain bright dot and the gaussian
+            # discs become the only source of glow around it.
+            outer, halo, _mid, _core = node
+            node.remove(outer, halo)
+            add_soft_bloom(node, NODE_RADIUS, palette[2], extras)
+        net.add_to_back(extras)
+        return net
     elif style == "pulse":
         for node in nodes:
             add_pulse_breathe(node)

@@ -148,9 +148,45 @@ NET_EDGE_COLORS = [GREEN_EDGE, TEAL_EDGE, BLUE_EDGE, PURPLE_EDGE, MAGENTA_EDGE]
 CODE_COLOR = "#7FE8C0"
 ARROW_COLOR = "#8FA6C2"
 
-LEFT_X = -4.6
 MID_X = 0.0
-RIGHT_X = 4.6
+
+# Layout: rather than fixed left/right net centers, every net's center is
+# solved so the gap between the screen edge and its own outermost point is
+# always OUTER_MARGIN, regardless of that net's radius -- a bigger net's
+# center shifts further inward (toward MID_X) instead of crowding the frame
+# edge the way a fixed center would. Likewise every net-arrow/arrow-code
+# gap is the fixed GAP, not a fraction of the (shrinking, as nets grow)
+# space between net and code -- so spacing reads the same at every lap and
+# only the arrows themselves change length to absorb the difference. Both
+# constants are set as large as the tightest lap (the final one, where
+# both flanking nets are near their largest) can afford -- every other lap
+# just ends up with longer arrows, never a different gap.
+OUTER_MARGIN = 0.4
+GAP = 0.3
+
+
+def left_net_center(radius):
+    """Center x for a net sitting in the left slot with this radius, such
+    that its outer (leftmost) edge is always OUTER_MARGIN from the left
+    screen edge."""
+    return -config.frame_width / 2 + OUTER_MARGIN + radius
+
+
+def right_net_center(radius):
+    """Center x for a net sitting in the right slot with this radius, such
+    that its outer (rightmost) edge is always OUTER_MARGIN from the right
+    screen edge."""
+    return config.frame_width / 2 - OUTER_MARGIN - radius
+
+
+def left_facing_edge(radius):
+    """x of the left net's inward (code-facing) edge."""
+    return left_net_center(radius) + radius
+
+
+def right_facing_edge(radius):
+    """x of the right net's inward (code-facing) edge."""
+    return right_net_center(radius) - radius
 
 # How far (and how fast) each node idly wanders from its own home spot.
 DRIFT_AMPLITUDE = 0.035
@@ -613,15 +649,15 @@ def make_arrow(start_x, end_x):
 def flow_arrows(left_net_edge, right_net_edge, brace, code):
     """The left (net -> code) and right (code -> net) arrows for one lap.
     Recomputed every time from the actual current geometry (net radii and
-    code/brace width both change every cycle) so each arrow keeps equal
-    padding on both of its own sides, rather than reusing fixed
-    coordinates that only lined up for one particular net size."""
+    code/brace width both change every cycle), padded by the fixed GAP on
+    every one of its four sides (net, arrow, brace/code, arrow, net) --
+    rather than a fraction of the available space -- so that gap reads the
+    same at every lap regardless of how big the flanking nets are; only
+    the arrows' own length absorbs whatever space is left over."""
     brace_left_edge = brace.get_left()[0]
     code_right_edge = code.get_right()[0]
-    left_margin = (brace_left_edge - left_net_edge) * 0.28
-    right_margin = (right_net_edge - code_right_edge) * 0.28
-    left_arrow = make_arrow(left_net_edge + left_margin, brace_left_edge - left_margin)
-    right_arrow = make_arrow(code_right_edge + right_margin, right_net_edge - right_margin)
+    left_arrow = make_arrow(left_net_edge + GAP, brace_left_edge - GAP)
+    right_arrow = make_arrow(code_right_edge + GAP, right_net_edge - GAP)
     return left_arrow, right_arrow
 
 
@@ -695,8 +731,13 @@ class RecursiveSelfImprovement(ThreeDScene):
         beat, not its first lap in disguise."""
         m = SPEED_MULTIPLIERS[0]
 
+        net0_radius = STAGES[0]["cloud_radius"]
+        net1_radius = INTRO_END_STAGE["cloud_radius"]
         net0, nodes0, edges0, glow0 = build_net(
-            center=np.array([LEFT_X, 0, 0]), palette=BLUE_PALETTE, edge_color=BLUE_EDGE, **STAGES[0]
+            center=np.array([left_net_center(net0_radius), 0, 0]),
+            palette=BLUE_PALETTE,
+            edge_color=BLUE_EDGE,
+            **STAGES[0],
         )
         self.grow_in(nodes0, edges0, glow0, run_time=1.1 * m)
         self.hold(0.4 * m)
@@ -704,7 +745,7 @@ class RecursiveSelfImprovement(ThreeDScene):
         code = make_code_block(CODE_STAGE_1, np.array([MID_X, 0, 0]))
         brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
         left_arrow, right_arrow = flow_arrows(
-            LEFT_X + STAGES[0]["cloud_radius"], RIGHT_X - INTRO_END_STAGE["cloud_radius"], brace, code
+            left_facing_edge(net0_radius), right_facing_edge(net1_radius), brace, code
         )
 
         self.play(GrowArrow(left_arrow), run_time=0.5 * m)
@@ -718,7 +759,10 @@ class RecursiveSelfImprovement(ThreeDScene):
         self.play(GrowArrow(right_arrow), run_time=0.5 * m)
 
         net1, nodes1, edges1, glow1 = build_net(
-            center=np.array([RIGHT_X, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **INTRO_END_STAGE
+            center=np.array([right_net_center(net1_radius), 0, 0]),
+            palette=RED_PALETTE,
+            edge_color=RED_EDGE,
+            **INTRO_END_STAGE,
         )
         self.grow_in(nodes1, edges1, glow1, run_time=max(1.3 * m, 0.5))
         self.hold(0.5 * m)
@@ -743,12 +787,15 @@ class RecursiveSelfImprovement(ThreeDScene):
     def construct_main(self, backdrop):
         # Net 0 spawns on the left, green for its whole lifetime -- grown
         # in at the same unhurried pace as the first loop iteration below.
+        current_radius = STAGES[0]["cloud_radius"]
         current_net, current_nodes, current_edges, current_glow = build_net(
-            center=np.array([LEFT_X, 0, 0]), palette=NET_PALETTES[0], edge_color=NET_EDGE_COLORS[0], **STAGES[0]
+            center=np.array([left_net_center(current_radius), 0, 0]),
+            palette=NET_PALETTES[0],
+            edge_color=NET_EDGE_COLORS[0],
+            **STAGES[0],
         )
         self.grow_in(current_nodes, current_edges, current_glow, run_time=1.1 * SPEED_MULTIPLIERS[0])
         self.hold(0.4 * SPEED_MULTIPLIERS[0])
-        current_radius = STAGES[0]["cloud_radius"]
 
         # Left net -> left arrow -> code typing in behind a brace -> right
         # arrow -> a bigger net (its own fixed color) grows on the right
@@ -757,10 +804,11 @@ class RecursiveSelfImprovement(ThreeDScene):
         # Every beat in the lap is scaled by that lap's own multiplier, so
         # early laps linger and later laps snap by increasingly fast.
         for i, (stage, code_lines, m) in enumerate(zip(STAGES[1:], CODE_STAGES, SPEED_MULTIPLIERS), start=1):
+            stage_radius = stage["cloud_radius"]
             code = make_code_block(code_lines, np.array([MID_X, 0, 0]))
             brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
             left_arrow, right_arrow = flow_arrows(
-                LEFT_X + current_radius, RIGHT_X - stage["cloud_radius"], brace, code
+                left_facing_edge(current_radius), right_facing_edge(stage_radius), brace, code
             )
 
             self.play(GrowArrow(left_arrow), run_time=0.5 * m)
@@ -775,24 +823,28 @@ class RecursiveSelfImprovement(ThreeDScene):
             self.play(GrowArrow(right_arrow), run_time=0.5 * m)
 
             next_net, next_nodes, next_edges, next_glow = build_net(
-                center=np.array([RIGHT_X, 0, 0]), palette=NET_PALETTES[i], edge_color=NET_EDGE_COLORS[i], **stage
+                center=np.array([right_net_center(stage_radius), 0, 0]),
+                palette=NET_PALETTES[i],
+                edge_color=NET_EDGE_COLORS[i],
+                **stage,
             )
             self.grow_in(next_nodes, next_edges, next_glow, run_time=max(1.3 * m, 0.5))
             self.hold(0.5 * m)
 
             stop_drift(next_nodes, next_edges)
+            slide_shift = left_net_center(stage_radius) - right_net_center(stage_radius)
             self.play(
                 FadeOut(current_net),
                 FadeOut(code),
                 FadeOut(brace),
                 FadeOut(left_arrow),
                 FadeOut(right_arrow),
-                next_net.animate.shift(np.array([LEFT_X - RIGHT_X, 0, 0])),
+                next_net.animate.shift(np.array([slide_shift, 0, 0])),
                 run_time=max(1.0 * m, 0.45),
             )
             resume_drift(next_nodes, next_edges)
             current_net, current_nodes, current_edges, current_glow = next_net, next_nodes, next_edges, next_glow
-            current_radius = stage["cloud_radius"]
+            current_radius = stage_radius
 
         self.hold(0.4 * SPEED_MULTIPLIERS[-1])
 
@@ -804,8 +856,9 @@ class RecursiveSelfImprovement(ThreeDScene):
         code = make_code_block(CODE_STAGE_FINAL, np.array([MID_X, 0, 0]))
         brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
         ico_footprint_radius = FINAL_STAGE_RADIUS
+        ico_center_x = right_net_center(ico_footprint_radius)
         left_arrow, right_arrow = flow_arrows(
-            LEFT_X + current_radius, RIGHT_X - ico_footprint_radius, brace, code
+            left_facing_edge(current_radius), right_facing_edge(ico_footprint_radius), brace, code
         )
 
         self.play(GrowArrow(left_arrow), run_time=0.5 * FINAL_CODE_MULT)
@@ -821,7 +874,7 @@ class RecursiveSelfImprovement(ThreeDScene):
         self.play(GrowArrow(right_arrow), run_time=0.5 * FINAL_CODE_MULT)
 
         if INCLUDE_FINALE:
-            ico_offset = np.array([RIGHT_X, 0, 0])
+            ico_offset = np.array([ico_center_x, 0, 0])
             ico_vertices = VGroup(
                 *[
                     Dot3D(point=ico_offset + v, radius=0.11, color=RED_CORE, resolution=(12, 12))
@@ -860,7 +913,7 @@ class RecursiveSelfImprovement(ThreeDScene):
                 FadeOut(left_arrow),
                 FadeOut(right_arrow),
                 FadeOut(backdrop),
-                ico_group.animate.shift(np.array([-RIGHT_X, 0, 0])),
+                ico_group.animate.shift(np.array([-ico_center_x, 0, 0])),
                 run_time=1.2,
             )
 
@@ -880,7 +933,7 @@ class RecursiveSelfImprovement(ThreeDScene):
             # footprint radius already used to space the arrow above, so
             # the arrow's tip meets its edge.
             final_net, final_nodes, final_edges, final_glow = build_net(
-                center=np.array([RIGHT_X, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **FINAL_STAGE
+                center=np.array([ico_center_x, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **FINAL_STAGE
             )
             self.grow_in(final_nodes, final_edges, final_glow, run_time=max(1.3 * FINAL_CODE_MULT, 0.5))
             self.hold(0.6)
