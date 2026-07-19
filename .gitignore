@@ -1,0 +1,17 @@
+# Manim render output
+media/
+__pycache__/
+*.pyc
+
+# Python environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
