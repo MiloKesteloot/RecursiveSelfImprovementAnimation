@@ -54,18 +54,18 @@ from manim import (
     ORIGIN,
     PI,
     Arc,
-    Arrow,
     Circle,
     Dot3D,
     FadeIn,
     FadeOut,
     Group,
-    GrowArrow,
     GrowFromCenter,
+    GrowFromPoint,
     ImageMobject,
     LaggedStart,
     Line,
     Line3D,
+    Polygon,
     Text,
     ThreeDScene,
     VGroup,
@@ -150,43 +150,54 @@ ARROW_COLOR = "#8FA6C2"
 
 MID_X = 0.0
 
-# Layout: rather than fixed left/right net centers, every net's center is
-# solved so the gap between the screen edge and its own outermost point is
-# always OUTER_MARGIN, regardless of that net's radius -- a bigger net's
-# center shifts further inward (toward MID_X) instead of crowding the frame
-# edge the way a fixed center would. Likewise every net-arrow/arrow-code
-# gap is the fixed GAP, not a fraction of the (shrinking, as nets grow)
-# space between net and code -- so spacing reads the same at every lap and
-# only the arrows themselves change length to absorb the difference. Both
-# constants are set as large as the tightest lap (the final one, where
-# both flanking nets are near their largest) can afford -- every other lap
-# just ends up with longer arrows, never a different gap.
-OUTER_MARGIN = 0.4
-GAP = 0.3
+# Layout: code always stays put at MID_X. Every arrow is a fixed,
+# constant-looking ARROW_LENGTH padded by the fixed GAP on each side --
+# not a fraction of whatever space happens to be left, which used to make
+# arrows balloon to several units long next to a small net. A net's
+# facing (code-side) edge therefore only depends on that lap's actual
+# code/brace geometry, never on the net's own radius -- so the arrow is
+# exactly ARROW_LENGTH on every single lap, with zero exceptions. Radius
+# only decides how far the net's *far* edge sits from there, which in turn
+# decides how much room is left over between the net and the screen edge
+# -- that leftover is allowed to vary a lot (a small net ends up with a
+# big margin, a big net a small one) rather than solving for a constant
+# outer margin, since holding the arrow length constant and the outer
+# margin constant turned out to be impossible to satisfy at once within
+# the frame -- given a choice, short arrows read far better than
+# perfectly even margins.
+GAP = 0.25
+ARROW_LENGTH = 0.7
 
 
-def left_net_center(radius):
-    """Center x for a net sitting in the left slot with this radius, such
-    that its outer (leftmost) edge is always OUTER_MARGIN from the left
-    screen edge."""
-    return -config.frame_width / 2 + OUTER_MARGIN + radius
+def left_facing_edge(brace_left_edge):
+    """x of a net's inward (code-facing) edge when the arrow it feeds
+    ends at this brace's left tip. Independent of the net's own radius --
+    only GAP and ARROW_LENGTH separate the two."""
+    return brace_left_edge - 2 * GAP - ARROW_LENGTH
 
 
-def right_net_center(radius):
-    """Center x for a net sitting in the right slot with this radius, such
-    that its outer (rightmost) edge is always OUTER_MARGIN from the right
-    screen edge."""
-    return config.frame_width / 2 - OUTER_MARGIN - radius
+def right_facing_edge(code_right_edge):
+    """x of a net's inward (code-facing) edge when the arrow feeding it
+    starts at this code block's right edge."""
+    return code_right_edge + 2 * GAP + ARROW_LENGTH
 
 
-def left_facing_edge(radius):
-    """x of the left net's inward (code-facing) edge."""
-    return left_net_center(radius) + radius
+def left_net_center(radius, brace_left_edge):
+    return left_facing_edge(brace_left_edge) - radius
 
 
-def right_facing_edge(radius):
-    """x of the right net's inward (code-facing) edge."""
-    return right_net_center(radius) - radius
+def right_net_center(radius, code_right_edge):
+    return right_facing_edge(code_right_edge) + radius
+
+
+def brace_left_for(code_lines):
+    """The brace-tip x a code block built from these lines would have,
+    without actually building the real (about-to-be-displayed) code/brace
+    for this lap -- used to look ahead at the *next* lap's geometry so a
+    net can be slid directly to where its next arrow will need it."""
+    code = make_code_block(code_lines, np.array([MID_X, 0, 0]))
+    brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
+    return brace.get_left()[0]
 
 # How far (and how fast) each node idly wanders from its own home spot.
 DRIFT_AMPLITUDE = 0.035
@@ -512,10 +523,17 @@ def make_glow_blob(local_points, edge_indices, cloud_radius, node_radius):
     return image
 
 
-def sample_cloud(n, radius, seed, min_dist_factor=0.32):
+def sample_cloud(n, radius, node_radius, seed, min_dist_factor=0.32):
     """n points scattered inside a disc of the given radius, rejecting
     anything too close to a point already placed -- rough blue-noise
-    spacing, so nodes read as an organic cluster rather than a grid."""
+    spacing, so nodes read as an organic cluster rather than a grid.
+    Whatever that blue-noise spacing works out to, it's never allowed
+    below 3*node_radius -- two touching node circles (2*node_radius)
+    plus a full extra node_radius of clear margin between them -- so
+    nodes at this size can never actually overlap, even for the
+    sparsest/smallest-radius stages where the proportional spacing
+    alone would allow it."""
+    min_dist = max(radius * min_dist_factor, 3 * node_radius)
     rng = random.Random(seed)
     points = []
     tries = 0
@@ -525,7 +543,7 @@ def sample_cloud(n, radius, seed, min_dist_factor=0.32):
         if x * x + y * y > 1:
             continue
         candidate = np.array([x * radius, y * radius, 0])
-        if all(np.linalg.norm(candidate - p) > radius * min_dist_factor for p in points):
+        if all(np.linalg.norm(candidate - p) > min_dist for p in points):
             points.append(candidate)
     return points
 
@@ -549,7 +567,7 @@ def nearest_neighbor_edges(points, k):
 
 
 def build_net(n_nodes, cloud_radius, k_neighbors, node_radius, seed, center, palette, edge_color):
-    local_points = sample_cloud(n_nodes, cloud_radius, seed)
+    local_points = sample_cloud(n_nodes, cloud_radius, node_radius, seed)
     points = [center + p for p in local_points]
 
     nodes_list = [make_node(p, node_radius, palette) for p in points]
@@ -609,41 +627,49 @@ def make_bracket(target, buff=0.25, color=ARROW_COLOR, stroke_width=4):
     return bracket
 
 
+ARROW_SHAFT_HALF_HEIGHT = 0.11  # shaft thickness, matching the old stroke_width=22 look
+ARROW_TIP_HALF_HEIGHT = 0.175  # arrowhead half-width, matching the old tip_length=0.35 look
+ARROW_TIP_LENGTH = 0.35
+
+
 def make_arrow(start_x, end_x):
-    # Thick shaft and a wide, chunky head -- a flat "block arrow" look
-    # like the reference image's, rather than a thin stroked line with a
-    # small triangle tip. Both stroke_width (shaft thickness) and
-    # tip_length (arrowhead size) default to scaling down proportionally
-    # to the arrow's own length, and this scene's arrows span a wide
-    # range of lengths (net radius and code/brace width both change every
-    # lap) -- left alone, that made some laps' arrows read as a proper
-    # wide arrowhead and others as a stubby point stuck on an unchanged
-    # thick rectangle, since the two didn't shrink at the same rate. Both
-    # ratio ceilings are set well past any length this scene actually
-    # produces, so tip_length and stroke_width stay pinned at their fixed
-    # values and only the shaft's length -- the part actually free to
-    # change -- responds to the available space.
-    arrow = Arrow(
-        start=np.array([start_x, 0, 0]),
-        end=np.array([end_x, 0, 0]),
-        color=ARROW_COLOR,
-        stroke_width=22,
-        buff=0,
-        tip_length=0.35,
-        max_tip_length_to_length_ratio=5.0,
-        max_stroke_width_to_length_ratio=100,
-    )
-    # Manim positions the tip flush against the shaft's end rather than
-    # overlapping it, so the two separately-rendered shapes only just
-    # touch -- which shows up as a thin seam line at that boundary once
-    # compressed to video. Pulling the tip back very slightly along the
-    # arrow's own direction overlaps it onto the shaft instead, hiding
-    # the seam under solid tip fill (confirmed against a rendered frame:
-    # the seam is gone with this nudge, present without it).
-    tip_direction = arrow.tip.vector
-    tip_direction = tip_direction / np.linalg.norm(tip_direction)
-    arrow.tip.shift(-0.04 * tip_direction)
+    """A thick, chunky block arrow -- a single filled polygon (shaft
+    rectangle merged with a triangular head into one continuous outline)
+    rather than manim's own Arrow, which pairs a separately-rendered Line
+    and ArrowTip. Two overlapping shapes of the same color always show a
+    seam where they meet at full opacity, and -- worse -- a visibly
+    different shade in the overlap while fading out, since two
+    stacked semi-transparent layers of the same color never composite to
+    look like a single layer at that opacity. A single shape has neither
+    problem: there's exactly one fill, so exactly one opacity, everywhere,
+    always.
+    """
+    tip_length = min(ARROW_TIP_LENGTH, abs(end_x - start_x) * 0.6)
+    base_x = end_x - tip_length if end_x >= start_x else end_x + tip_length
+    points = [
+        [start_x, ARROW_SHAFT_HALF_HEIGHT, 0],
+        [base_x, ARROW_SHAFT_HALF_HEIGHT, 0],
+        [base_x, ARROW_TIP_HALF_HEIGHT, 0],
+        [end_x, 0, 0],
+        [base_x, -ARROW_TIP_HALF_HEIGHT, 0],
+        [base_x, -ARROW_SHAFT_HALF_HEIGHT, 0],
+        [start_x, -ARROW_SHAFT_HALF_HEIGHT, 0],
+    ]
+    arrow = Polygon(*points, color=ARROW_COLOR, fill_opacity=1, stroke_width=0)
+    # GrowArrow (used elsewhere for manim's own Arrow) needs an Arrow
+    # instance specifically; grow_arrow() below animates any mobject from
+    # a point instead, so the tail position is stashed here rather than
+    # re-derived from the polygon's bounding box (whose vertical center
+    # is skewed toward the wider tip, not the shaft's true centerline).
+    arrow.tail_point = np.array([start_x, 0.0, 0.0])
     return arrow
+
+
+def grow_arrow(arrow, **kwargs):
+    """Grow one of this file's own block arrows (see make_arrow) from its
+    tail -- the same visual beat as manim's GrowArrow, which only accepts
+    its own Arrow class and so can't be used on our plain Polygon."""
+    return GrowFromPoint(arrow, arrow.tail_point, **kwargs)
 
 
 def flow_arrows(left_net_edge, right_net_edge, brace, code):
@@ -733,8 +759,16 @@ class RecursiveSelfImprovement(ThreeDScene):
 
         net0_radius = STAGES[0]["cloud_radius"]
         net1_radius = INTRO_END_STAGE["cloud_radius"]
+
+        # Built now (rather than after net0 grows in) purely to read its
+        # geometry -- net0's position depends on where this code's brace
+        # will sit, not the other way around. It isn't displayed until
+        # the Write() below.
+        code = make_code_block(CODE_STAGE_1, np.array([MID_X, 0, 0]))
+        brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
+
         net0, nodes0, edges0, glow0 = build_net(
-            center=np.array([left_net_center(net0_radius), 0, 0]),
+            center=np.array([left_net_center(net0_radius, brace.get_left()[0]), 0, 0]),
             palette=BLUE_PALETTE,
             edge_color=BLUE_EDGE,
             **STAGES[0],
@@ -742,13 +776,11 @@ class RecursiveSelfImprovement(ThreeDScene):
         self.grow_in(nodes0, edges0, glow0, run_time=1.1 * m)
         self.hold(0.4 * m)
 
-        code = make_code_block(CODE_STAGE_1, np.array([MID_X, 0, 0]))
-        brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
         left_arrow, right_arrow = flow_arrows(
-            left_facing_edge(net0_radius), right_facing_edge(net1_radius), brace, code
+            left_facing_edge(brace.get_left()[0]), right_facing_edge(code.get_right()[0]), brace, code
         )
 
-        self.play(GrowArrow(left_arrow), run_time=0.5 * m)
+        self.play(grow_arrow(left_arrow), run_time=0.5 * m)
         self.play(
             LaggedStart(
                 *[Write(row) for row in code], lag_ratio=0.3, run_time=(0.5 + 0.16 * len(CODE_STAGE_1)) * m
@@ -756,10 +788,10 @@ class RecursiveSelfImprovement(ThreeDScene):
             GrowFromCenter(brace, run_time=0.35 * m),
         )
         self.hold(0.4 * m)
-        self.play(GrowArrow(right_arrow), run_time=0.5 * m)
+        self.play(grow_arrow(right_arrow), run_time=0.5 * m)
 
         net1, nodes1, edges1, glow1 = build_net(
-            center=np.array([right_net_center(net1_radius), 0, 0]),
+            center=np.array([right_net_center(net1_radius, code.get_right()[0]), 0, 0]),
             palette=RED_PALETTE,
             edge_color=RED_EDGE,
             **INTRO_END_STAGE,
@@ -785,11 +817,21 @@ class RecursiveSelfImprovement(ThreeDScene):
         )
 
     def construct_main(self, backdrop):
+        # Code the *next* lap will show, one entry per lap in order,
+        # ending with the final lap's -- known up front since every
+        # code block is static content, so a net can be slid straight to
+        # where its own next arrow will need it (see the lookahead below)
+        # instead of wherever this lap's different code would have put it.
+        lap_code_lines = CODE_STAGES + [CODE_STAGE_FINAL]
+
         # Net 0 spawns on the left, green for its whole lifetime -- grown
-        # in at the same unhurried pace as the first loop iteration below.
-        current_radius = STAGES[0]["cloud_radius"]
+        # in at the same unhurried pace as the first loop iteration below,
+        # already positioned for lap 1's own code so its arrow is exactly
+        # ARROW_LENGTH from the very first frame.
         current_net, current_nodes, current_edges, current_glow = build_net(
-            center=np.array([left_net_center(current_radius), 0, 0]),
+            center=np.array(
+                [left_net_center(STAGES[0]["cloud_radius"], brace_left_for(lap_code_lines[0])), 0, 0]
+            ),
             palette=NET_PALETTES[0],
             edge_color=NET_EDGE_COLORS[0],
             **STAGES[0],
@@ -808,10 +850,10 @@ class RecursiveSelfImprovement(ThreeDScene):
             code = make_code_block(code_lines, np.array([MID_X, 0, 0]))
             brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
             left_arrow, right_arrow = flow_arrows(
-                left_facing_edge(current_radius), right_facing_edge(stage_radius), brace, code
+                left_facing_edge(brace.get_left()[0]), right_facing_edge(code.get_right()[0]), brace, code
             )
 
-            self.play(GrowArrow(left_arrow), run_time=0.5 * m)
+            self.play(grow_arrow(left_arrow), run_time=0.5 * m)
             self.play(
                 LaggedStart(
                     *[Write(row) for row in code], lag_ratio=0.3, run_time=(0.5 + 0.16 * len(code_lines)) * m
@@ -820,10 +862,10 @@ class RecursiveSelfImprovement(ThreeDScene):
             )
             self.hold(0.4 * m)
 
-            self.play(GrowArrow(right_arrow), run_time=0.5 * m)
+            self.play(grow_arrow(right_arrow), run_time=0.5 * m)
 
             next_net, next_nodes, next_edges, next_glow = build_net(
-                center=np.array([right_net_center(stage_radius), 0, 0]),
+                center=np.array([right_net_center(stage_radius, code.get_right()[0]), 0, 0]),
                 palette=NET_PALETTES[i],
                 edge_color=NET_EDGE_COLORS[i],
                 **stage,
@@ -832,7 +874,8 @@ class RecursiveSelfImprovement(ThreeDScene):
             self.hold(0.5 * m)
 
             stop_drift(next_nodes, next_edges)
-            slide_shift = left_net_center(stage_radius) - right_net_center(stage_radius)
+            new_left_center = left_net_center(stage_radius, brace_left_for(lap_code_lines[i]))
+            slide_shift = new_left_center - right_net_center(stage_radius, code.get_right()[0])
             self.play(
                 FadeOut(current_net),
                 FadeOut(code),
@@ -844,7 +887,6 @@ class RecursiveSelfImprovement(ThreeDScene):
             )
             resume_drift(next_nodes, next_edges)
             current_net, current_nodes, current_edges, current_glow = next_net, next_nodes, next_edges, next_glow
-            current_radius = stage_radius
 
         self.hold(0.4 * SPEED_MULTIPLIERS[-1])
 
@@ -856,12 +898,12 @@ class RecursiveSelfImprovement(ThreeDScene):
         code = make_code_block(CODE_STAGE_FINAL, np.array([MID_X, 0, 0]))
         brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
         ico_footprint_radius = FINAL_STAGE_RADIUS
-        ico_center_x = right_net_center(ico_footprint_radius)
+        ico_center_x = right_net_center(ico_footprint_radius, code.get_right()[0])
         left_arrow, right_arrow = flow_arrows(
-            left_facing_edge(current_radius), right_facing_edge(ico_footprint_radius), brace, code
+            left_facing_edge(brace.get_left()[0]), right_facing_edge(code.get_right()[0]), brace, code
         )
 
-        self.play(GrowArrow(left_arrow), run_time=0.5 * FINAL_CODE_MULT)
+        self.play(grow_arrow(left_arrow), run_time=0.5 * FINAL_CODE_MULT)
         self.play(
             LaggedStart(
                 *[Write(row) for row in code],
@@ -871,7 +913,7 @@ class RecursiveSelfImprovement(ThreeDScene):
             GrowFromCenter(brace, run_time=0.35 * FINAL_CODE_MULT),
         )
         self.hold(0.4 * FINAL_CODE_MULT)
-        self.play(GrowArrow(right_arrow), run_time=0.5 * FINAL_CODE_MULT)
+        self.play(grow_arrow(right_arrow), run_time=0.5 * FINAL_CODE_MULT)
 
         if INCLUDE_FINALE:
             ico_offset = np.array([ico_center_x, 0, 0])

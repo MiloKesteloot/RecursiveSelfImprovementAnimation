@@ -4,30 +4,29 @@ in recursive_self_improvement.py (layered halo rings, a blurred glow
 blob underneath, thin lit edges) -- unlike the first pass at this file,
 none of these swap in a different node shape or drop the halo/blur look.
 Each cell instead just dials a different knob on that same look: a
-bigger/softer bloom, a breathing pulse, expanding sonar rings, a
-traveling comet, or an organic flicker.
+bigger/softer bloom, a breathing pulse, expanding sonar rings, bloom
+plus an occasional pulse, or bloom that itself breathes.
 
 Cell layout (row, col):
-  (0,0) Glow Halo    -- unchanged baseline from recursive_self_improvement.py:
-                         layered halo rings, blurred glow blob, gentle drift.
-  (0,1) Soft Bloom   -- same nodes plus one extra big, very soft bloom
-                         circle behind each one, and a larger/softer
-                         glow blob -- a turned-up, dreamier version of
-                         the same halo.
-  (0,2) Pulse Core   -- same nodes, but each one's outer halo ring
-                         breathes (grows/brightens and shrinks/dims) on
-                         its own slow cycle, out of phase with its
-                         neighbors, while the core stays steady.
-  (1,0) Sonar Rings  -- same nodes, plus each one periodically sends out
-                         an expanding, fading ring -- like a soft radar
-                         ping -- staggered per node.
-  (1,1) Comet Edges  -- same nodes and edges, plus a small glowing comet
-                         that continuously travels each edge from one
-                         node to the other, fading in and out at the ends.
-  (1,2) Flicker Aura -- same nodes, but each halo's brightness flickers
-                         unevenly (summed random-phase sine waves, not a
-                         clean pulse) with occasional brighter flares --
-                         an organic, candle-like glow instead of a steady one.
+  (0,0) Glow Halo     -- unchanged baseline from recursive_self_improvement.py:
+                          layered halo rings, blurred glow blob, gentle drift.
+  (0,1) Soft Bloom    -- the node's own flat halo rings replaced with a
+                          real blurred glow (gaussian raster, not stacked
+                          opacity circles) behind a plain bright core.
+  (0,2) Pulse Core    -- same nodes, but each one's outer halo ring
+                          breathes (grows/brightens and shrinks/dims) on
+                          its own slow cycle, out of phase with its
+                          neighbors, while the core stays steady.
+  (1,0) Sonar Rings   -- same nodes, plus each one periodically sends out
+                          an expanding, fading ring -- like a soft radar
+                          ping -- staggered per node.
+  (1,1) Bloom Pulse   -- Soft Bloom's node/glow treatment, plus every so
+                          often (at random, not on a steady cycle) a ring
+                          expands out and fades over one of the nodes.
+  (1,2) Bloom Breathe -- Soft Bloom's node/glow treatment, but the glow
+                          discs themselves continuously grow and shrink
+                          -- Pulse Core's breathing motion applied to the
+                          blobs instead of to a ring outline.
 
 Run with:
     manim -pql visual_tests.py VisualStyleTests
@@ -42,7 +41,7 @@ import os
 import random
 
 import numpy as np
-from manim import DOWN, Circle, FadeIn, FadeOut, Group, ImageMobject, LaggedStart, Scene, Text, VGroup, config
+from manim import DOWN, Circle, FadeIn, FadeOut, Group, ImageMobject, LaggedStart, Scene, Text, config
 
 from recursive_self_improvement import (
     BACKGROUND_COLOR,
@@ -118,12 +117,50 @@ def make_glow_disc(span_radius, sigma_radius, color, peak_alpha):
     return image
 
 
+def strip_halo_rings(node):
+    """Remove the node's own flat halo rings (outer, halo) -- with those
+    still layered on top of the blurred glow discs below, the node reads
+    as double-glowing. Left with just mid/core, the node is a plain
+    bright dot and the gaussian discs become the only source of glow
+    around it."""
+    outer, halo, _mid, _core = node
+    node.remove(outer, halo)
+
+
 def add_soft_bloom(node, radius, glow_color, extras):
-    for span_mult, sigma_mult, peak_alpha in ((9.0, 3.2, 100), (5.0, 1.5, 190)):
+    for span_mult, sigma_mult, peak_alpha in ((6.5, 2.2, 60), (3.6, 1.0, 115)):
         disc = make_glow_disc(radius * span_mult, radius * sigma_mult, glow_color, peak_alpha)
         disc.move_to(node.get_center())
         disc.add_updater(lambda mob: mob.move_to(node.get_center()))
         extras.add(disc)
+
+
+# --- Bloom Breathe: Soft Bloom's static glow, plus a new crisp ring
+#     breathing on top -- exactly Pulse Core's halo mechanic, just as an
+#     added ring rather than reusing the node's own (already-stripped)
+#     halo child. The blurry bloom discs themselves are untouched here
+#     and never animate; only this new solid-stroke ring pulses.
+
+
+def add_bloom_breathe(node, radius, glow_color, extras, amplitude=0.32, speed=1.6):
+    add_soft_bloom(node, radius, glow_color, extras)
+
+    ring = Circle(radius=radius * 1.5, stroke_color=glow_color, stroke_width=2, fill_color=glow_color, fill_opacity=0.18)
+    ring.move_to(node.get_center())
+    node.add(ring)
+
+    state = {"t": random.uniform(0, 2 * math.pi), "scale": 1.0}
+
+    def updater(mob, dt):
+        state["t"] += dt * speed
+        wave = 0.5 + 0.5 * math.sin(state["t"])
+        target_scale = 1.0 + amplitude * wave
+        ring.scale(target_scale / state["scale"], about_point=node.get_center())
+        ring.set_fill(opacity=0.14 + 0.3 * wave)
+        ring.set_stroke(opacity=0.35 + 0.5 * wave)
+        state["scale"] = target_scale
+
+    node.add_updater(updater)
 
 
 # --- Pulse Core: the halo ring breathes, the core stays steady -----------
@@ -166,49 +203,42 @@ def add_sonar_rings(node, base_radius, color, extras, count=2, period=2.6):
         extras.add(ring)
 
 
-# --- Comet Edges: a small glowing dot travels each edge on a loop --------
+# --- Bloom Pulse: soft bloom nodes, plus an occasional ring passing over
+#     a node -- like Pulse Core's breathing ring, but a rare one-off event
+#     per node instead of something continuously breathing.
 
 
-def add_edge_comet(edge, color, extras, period, phase):
-    dot = Circle(radius=0.045, stroke_width=0, fill_color=color, fill_opacity=0.95)
-    glow = Circle(radius=0.1, stroke_width=0, fill_color=color, fill_opacity=0.35)
-    comet = VGroup(glow, dot)
-    state = {"t": phase}
+def add_occasional_pulse(node, base_radius, color, extras):
+    ring = Circle(radius=base_radius, stroke_color=color, stroke_width=2.4, fill_opacity=0)
+    max_growth = base_radius * 3.2
+    duration = 1.0
+    # Cooldowns tripled (both here and below) to bring pings down to
+    # roughly a third of their original frequency.
+    state = {"active": False, "t": 0.0, "cooldown": random.uniform(1.5, 12.0)}
 
     def updater(mob, dt):
+        if not state["active"]:
+            state["cooldown"] -= dt
+            mob.set_stroke(opacity=0)
+            if state["cooldown"] <= 0:
+                state["active"] = True
+                state["t"] = 0.0
+            return
         state["t"] += dt
-        prop = (state["t"] % period) / period
-        a, b = edge.node_a.get_center(), edge.node_b.get_center()
-        mob.move_to(a + (b - a) * prop)
-        fade = min(1.0, prop * 6, (1 - prop) * 6)
-        glow.set_fill(opacity=0.35 * fade)
-        dot.set_fill(opacity=0.95 * fade)
+        progress = state["t"] / duration
+        if progress >= 1.0:
+            state["active"] = False
+            state["cooldown"] = random.uniform(4.5, 15.0)
+            mob.set_stroke(opacity=0)
+            return
+        mob.become(
+            Circle(radius=base_radius + max_growth * progress, stroke_color=color, stroke_width=2.4, fill_opacity=0)
+        )
+        mob.move_to(node.get_center())
+        mob.set_stroke(opacity=(1.0 - progress) * 0.85)
 
-    comet.add_updater(updater)
-    extras.add(comet)
-
-
-# --- Flicker Aura: organic, uneven brightness with occasional flares -----
-
-
-def add_flicker(node, speed=1.0):
-    outer, halo, _mid, _core = node
-    freqs = [random.uniform(0.5, 1.4) for _ in range(3)]
-    phases = [random.uniform(0, 2 * math.pi) for _ in range(3)]
-    state = {"t": random.uniform(0, 10), "flare": 0.0}
-
-    def updater(mob, dt):
-        state["t"] += dt * speed
-        wobble = sum(math.sin(state["t"] * f + p) for f, p in zip(freqs, phases)) / 3
-        level = 0.6 + 0.4 * wobble
-        state["flare"] = max(0.0, state["flare"] - dt * 1.4)
-        if random.random() < dt * 0.15:
-            state["flare"] = 1.0
-        boost = 1.0 + 1.6 * state["flare"]
-        outer.set_fill(opacity=min(1.0, 0.10 * level * boost))
-        halo.set_fill(opacity=min(1.0, 0.28 * level * boost))
-
-    node.add_updater(updater)
+    ring.add_updater(updater)
+    extras.add(ring)
 
 
 def build_cell(center, seed, palette, edge_color, style):
@@ -228,13 +258,7 @@ def build_cell(center, seed, palette, edge_color, style):
         pass
     elif style == "bloom":
         for node in nodes:
-            # Strip the node's own flat halo rings (outer, halo) -- with
-            # those still layered on top of the new blurred glow discs
-            # below, the node reads as double-glowing. Left with just
-            # mid/core, the node is a plain bright dot and the gaussian
-            # discs become the only source of glow around it.
-            outer, halo, _mid, _core = node
-            node.remove(outer, halo)
+            strip_halo_rings(node)
             add_soft_bloom(node, NODE_RADIUS, palette[2], extras)
         net.add_to_back(extras)
         return net
@@ -244,12 +268,19 @@ def build_cell(center, seed, palette, edge_color, style):
     elif style == "sonar":
         for node in nodes:
             add_sonar_rings(node, NODE_RADIUS, edge_color, extras)
-    elif style == "comet":
-        for edge in edges:
-            add_edge_comet(edge, palette[0], extras, period=random.uniform(1.8, 3.0), phase=random.uniform(0, 3))
-    elif style == "flicker":
+    elif style == "bloom_pulse":
         for node in nodes:
-            add_flicker(node)
+            strip_halo_rings(node)
+            add_soft_bloom(node, NODE_RADIUS, palette[2], extras)
+            add_occasional_pulse(node, NODE_RADIUS, palette[0], extras)
+        net.add_to_back(extras)
+        return net
+    elif style == "bloom_breathe":
+        for node in nodes:
+            strip_halo_rings(node)
+            add_bloom_breathe(node, NODE_RADIUS, palette[2], extras)
+        net.add_to_back(extras)
+        return net
 
     return Group(net, extras)
 
@@ -265,8 +296,8 @@ class VisualStyleTests(Scene):
             (ROWS_Y[0], COLS_X[1], "Soft Bloom", TEAL_PALETTE, TEAL_EDGE, "bloom"),
             (ROWS_Y[0], COLS_X[2], "Pulse Core", BLUE_PALETTE, BLUE_EDGE, "pulse"),
             (ROWS_Y[1], COLS_X[0], "Sonar Rings", PURPLE_PALETTE, PURPLE_EDGE, "sonar"),
-            (ROWS_Y[1], COLS_X[1], "Comet Edges", MAGENTA_PALETTE, MAGENTA_EDGE, "comet"),
-            (ROWS_Y[1], COLS_X[2], "Flicker Aura", RED_PALETTE, RED_EDGE, "flicker"),
+            (ROWS_Y[1], COLS_X[1], "Bloom Pulse", MAGENTA_PALETTE, MAGENTA_EDGE, "bloom_pulse"),
+            (ROWS_Y[1], COLS_X[2], "Bloom Breathe", RED_PALETTE, RED_EDGE, "bloom_breathe"),
         ]
 
         nets = []
