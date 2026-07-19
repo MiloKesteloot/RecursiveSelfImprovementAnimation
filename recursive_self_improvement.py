@@ -233,6 +233,13 @@ STAGES = [
 ]
 CODE_STAGES = [CODE_STAGE_1, CODE_STAGE_2, CODE_STAGE_3, CODE_STAGE_4]
 
+# The mini-movie 1 intro's end net: a plain "larger net appears" beat, not
+# part of the main STAGES growth chain, so it gets its own stage dict
+# rather than being shoehorned into the existing 4/9/16/24/34 sequence.
+# cloud_radius follows the same cloud_radius = 0.37 * sqrt(n_nodes) scaling
+# STAGES uses, so node density matches its neighbors in that chain.
+INTRO_END_STAGE = dict(n_nodes=10, cloud_radius=1.17, k_neighbors=2, node_radius=0.088, seed=11)
+
 # One multiplier per STAGES[1:] transition: iterations start slow and
 # deliberate, then compress -- the same shape as the takeoff curves this
 # scene is about -- so the chain visibly accelerates into the finale
@@ -561,21 +568,42 @@ def make_bracket(target, buff=0.25, color=ARROW_COLOR, stroke_width=4):
 def make_arrow(start_x, end_x):
     # Thick shaft and a wide, chunky head -- a flat "block arrow" look
     # like the reference image's, rather than a thin stroked line with a
-    # small triangle tip. Arrow silently caps stroke_width at
-    # max_stroke_width_to_length_ratio * length (default ratio 5) --
-    # for these short arrows that clamped stroke_width right back down
-    # regardless of what was asked for, which is why turning it up
-    # barely changed anything; raising the ratio ceiling too is what
-    # actually lets a big stroke_width take effect.
+    # small triangle tip. Both stroke_width (shaft thickness) and
+    # tip_length (arrowhead size) default to scaling down proportionally
+    # to the arrow's own length, and this scene's arrows span a wide
+    # range of lengths (net radius and code/brace width both change every
+    # lap) -- left alone, that made some laps' arrows read as a proper
+    # wide arrowhead and others as a stubby point stuck on an unchanged
+    # thick rectangle, since the two didn't shrink at the same rate. Both
+    # ratio ceilings are set well past any length this scene actually
+    # produces, so tip_length and stroke_width stay pinned at their fixed
+    # values and only the shaft's length -- the part actually free to
+    # change -- responds to the available space.
     return Arrow(
         start=np.array([start_x, 0, 0]),
         end=np.array([end_x, 0, 0]),
         color=ARROW_COLOR,
         stroke_width=22,
         buff=0,
-        max_tip_length_to_length_ratio=0.4,
-        max_stroke_width_to_length_ratio=50,
+        tip_length=0.35,
+        max_tip_length_to_length_ratio=5.0,
+        max_stroke_width_to_length_ratio=100,
     )
+
+
+def flow_arrows(left_net_edge, right_net_edge, brace, code):
+    """The left (net -> code) and right (code -> net) arrows for one lap.
+    Recomputed every time from the actual current geometry (net radii and
+    code/brace width both change every cycle) so each arrow keeps equal
+    padding on both of its own sides, rather than reusing fixed
+    coordinates that only lined up for one particular net size."""
+    brace_left_edge = brace.get_left()[0]
+    code_right_edge = code.get_right()[0]
+    left_margin = (brace_left_edge - left_net_edge) * 0.28
+    right_margin = (right_net_edge - code_right_edge) * 0.28
+    left_arrow = make_arrow(left_net_edge + left_margin, brace_left_edge - left_margin)
+    right_arrow = make_arrow(code_right_edge + right_margin, right_net_edge - right_margin)
+    return left_arrow, right_arrow
 
 
 class RecursiveSelfImprovement(ThreeDScene):
@@ -586,9 +614,102 @@ class RecursiveSelfImprovement(ThreeDScene):
         contribute render time without any visual change to show for it."""
         self.wait(duration if FULL_TIMING else min(duration, IDLE_HOLD))
 
+    def grow_in(self, nodes_group, edges_group, glow, run_time=1.1):
+        # Nodes and edges both start at t=0 within this single self.play()
+        # call -- rather than nodes finishing before edges even begin --
+        # so the net reads as growing in all at once.
+        #
+        # suspend_mobject_updating=False on both the LaggedStart itself
+        # and each animation inside it: Animation suspends a mobject's
+        # updaters for its own duration by default, and LaggedStart only
+        # resumes them once the whole group ends -- without the outer
+        # flag too, it suspends every node's drift updater for the entire
+        # grow-in regardless of the inner flags. Left suspended, each node
+        # sits frozen at its pre-grow position the whole time, then jumps
+        # the instant updating resumes and the updater computes a
+        # now-stale drift offset for the first time -- the "grows in,
+        # then teleports" glitch. Keeping drift live throughout avoids
+        # that discontinuity entirely rather than patching around it.
+        self.play(
+            FadeIn(glow),
+            LaggedStart(
+                *[GrowFromCenter(n, suspend_mobject_updating=False) for n in nodes_group],
+                lag_ratio=0.04,
+                suspend_mobject_updating=False,
+            ),
+            LaggedStart(
+                *[FadeIn(e, suspend_mobject_updating=False) for e in edges_group],
+                lag_ratio=0.02,
+                suspend_mobject_updating=False,
+            ),
+            run_time=run_time,
+        )
+
     def construct(self):
         self.camera.background_color = BACKGROUND_COLOR
         self.set_camera_orientation(phi=0 * DEGREES, theta=-90 * DEGREES)
+
+        # Mini-movie 1: a short, standalone taste of the same growth
+        # pattern (net -> code -> bigger net) used throughout mini-movie
+        # 2, then a beat of plain blank background as a hard cut between
+        # the two, then mini-movie 2 -- the full chain -- runs unchanged.
+        self.construct_intro()
+        self.hold(1.0)
+        self.construct_main()
+
+    def construct_intro(self):
+        """Mini-movie 1: one simple lap -- a small blue net grows in,
+        writes an ordinary training step, and a bigger red net grows in
+        response -- then everything clears for the blank cut before
+        mini-movie 2. Blue and red rather than the main chain's own
+        green-to-magenta progression, since this intro isn't actually
+        part of that chain -- it's a self-contained preview of the same
+        beat, not its first lap in disguise."""
+        backdrop = make_backdrop()
+        self.add_fixed_in_frame_mobjects(backdrop)
+
+        m = SPEED_MULTIPLIERS[0]
+
+        net0, nodes0, edges0, glow0 = build_net(
+            center=np.array([LEFT_X, 0, 0]), palette=BLUE_PALETTE, edge_color=BLUE_EDGE, **STAGES[0]
+        )
+        self.grow_in(nodes0, edges0, glow0, run_time=1.1 * m)
+        self.hold(0.4 * m)
+
+        code = make_code_block(CODE_STAGE_1, np.array([MID_X, 0, 0]))
+        brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
+        left_arrow, right_arrow = flow_arrows(
+            LEFT_X + STAGES[0]["cloud_radius"], RIGHT_X - INTRO_END_STAGE["cloud_radius"], brace, code
+        )
+
+        self.play(GrowArrow(left_arrow), run_time=0.5 * m)
+        self.play(
+            LaggedStart(
+                *[Write(row) for row in code], lag_ratio=0.3, run_time=(0.5 + 0.16 * len(CODE_STAGE_1)) * m
+            ),
+            GrowFromCenter(brace, run_time=0.35 * m),
+        )
+        self.hold(0.4 * m)
+        self.play(GrowArrow(right_arrow), run_time=0.5 * m)
+
+        net1, nodes1, edges1, glow1 = build_net(
+            center=np.array([RIGHT_X, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **INTRO_END_STAGE
+        )
+        self.grow_in(nodes1, edges1, glow1, run_time=max(1.3 * m, 0.5))
+        self.hold(0.5 * m)
+
+        self.play(
+            FadeOut(net0),
+            FadeOut(net1),
+            FadeOut(code),
+            FadeOut(brace),
+            FadeOut(left_arrow),
+            FadeOut(right_arrow),
+            FadeOut(backdrop),
+            run_time=max(1.0 * m, 0.45),
+        )
+
+    def construct_main(self):
         # Fixed in frame rather than plain self.add(): a flat, ORIGIN-
         # centered circle is part of the 3D scene like anything else, so
         # once the camera tilts for the icosahedron reveal it would be
@@ -602,58 +723,12 @@ class RecursiveSelfImprovement(ThreeDScene):
         backdrop = make_backdrop()
         self.add_fixed_in_frame_mobjects(backdrop)
 
-        def grow_in(nodes_group, edges_group, glow, run_time=1.1):
-            # Nodes and edges both start at t=0 within this single
-            # self.play() call -- rather than nodes finishing before edges
-            # even begin -- so the net reads as growing in all at once.
-            #
-            # suspend_mobject_updating=False on both the LaggedStart itself
-            # and each animation inside it: Animation suspends a mobject's
-            # updaters for its own duration by default, and LaggedStart
-            # only resumes them once the whole group ends -- without the
-            # outer flag too, it suspends every node's drift updater for
-            # the entire grow-in regardless of the inner flags. Left
-            # suspended, each node sits frozen at its pre-grow position the
-            # whole time, then jumps the instant updating resumes and the
-            # updater computes a now-stale drift offset for the first time
-            # -- the "grows in, then teleports" glitch. Keeping drift live
-            # throughout avoids that discontinuity entirely rather than
-            # patching around it.
-            self.play(
-                FadeIn(glow),
-                LaggedStart(
-                    *[GrowFromCenter(n, suspend_mobject_updating=False) for n in nodes_group],
-                    lag_ratio=0.04,
-                    suspend_mobject_updating=False,
-                ),
-                LaggedStart(
-                    *[FadeIn(e, suspend_mobject_updating=False) for e in edges_group],
-                    lag_ratio=0.02,
-                    suspend_mobject_updating=False,
-                ),
-                run_time=run_time,
-            )
-
-        def flow_arrows(left_net_edge, right_net_edge, brace, code):
-            # Recomputed every time from the actual current geometry (net
-            # radii and code/brace width both change every cycle) so each
-            # arrow keeps equal padding on both of its own sides, rather
-            # than reusing fixed coordinates that only lined up for one
-            # particular net size.
-            brace_left_edge = brace.get_left()[0]
-            code_right_edge = code.get_right()[0]
-            left_margin = (brace_left_edge - left_net_edge) * 0.28
-            right_margin = (right_net_edge - code_right_edge) * 0.28
-            left_arrow = make_arrow(left_net_edge + left_margin, brace_left_edge - left_margin)
-            right_arrow = make_arrow(code_right_edge + right_margin, right_net_edge - right_margin)
-            return left_arrow, right_arrow
-
         # Net 0 spawns on the left, green for its whole lifetime -- grown
         # in at the same unhurried pace as the first loop iteration below.
         current_net, current_nodes, current_edges, current_glow = build_net(
             center=np.array([LEFT_X, 0, 0]), palette=NET_PALETTES[0], edge_color=NET_EDGE_COLORS[0], **STAGES[0]
         )
-        grow_in(current_nodes, current_edges, current_glow, run_time=1.1 * SPEED_MULTIPLIERS[0])
+        self.grow_in(current_nodes, current_edges, current_glow, run_time=1.1 * SPEED_MULTIPLIERS[0])
         self.hold(0.4 * SPEED_MULTIPLIERS[0])
         current_radius = STAGES[0]["cloud_radius"]
 
@@ -684,7 +759,7 @@ class RecursiveSelfImprovement(ThreeDScene):
             next_net, next_nodes, next_edges, next_glow = build_net(
                 center=np.array([RIGHT_X, 0, 0]), palette=NET_PALETTES[i], edge_color=NET_EDGE_COLORS[i], **stage
             )
-            grow_in(next_nodes, next_edges, next_glow, run_time=max(1.3 * m, 0.5))
+            self.grow_in(next_nodes, next_edges, next_glow, run_time=max(1.3 * m, 0.5))
             self.hold(0.5 * m)
 
             stop_drift(next_nodes, next_edges)
