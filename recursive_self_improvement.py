@@ -240,6 +240,14 @@ CODE_STAGES = [CODE_STAGE_1, CODE_STAGE_2, CODE_STAGE_3, CODE_STAGE_4]
 # STAGES uses, so node density matches its neighbors in that chain.
 INTRO_END_STAGE = dict(n_nodes=10, cloud_radius=1.17, k_neighbors=2, node_radius=0.088, seed=11)
 
+# When INCLUDE_FINALE is off (the default), the last lap still needs
+# something on the right for its arrow to point at -- a final flat net,
+# red like the icosahedron it stands in for, grown at the same footprint
+# radius already used to space that lap's arrows (see ico_footprint_radius
+# in construct_main) so the arrow's tip meets the new net's edge.
+FINAL_STAGE_RADIUS = 2.0
+FINAL_STAGE = dict(n_nodes=30, cloud_radius=FINAL_STAGE_RADIUS, k_neighbors=3, node_radius=0.052, seed=6)
+
 # One multiplier per STAGES[1:] transition: iterations start slow and
 # deliberate, then compress -- the same shape as the takeoff curves this
 # scene is about -- so the chain visibly accelerates into the finale
@@ -579,7 +587,7 @@ def make_arrow(start_x, end_x):
     # produces, so tip_length and stroke_width stay pinned at their fixed
     # values and only the shaft's length -- the part actually free to
     # change -- responds to the available space.
-    return Arrow(
+    arrow = Arrow(
         start=np.array([start_x, 0, 0]),
         end=np.array([end_x, 0, 0]),
         color=ARROW_COLOR,
@@ -589,6 +597,17 @@ def make_arrow(start_x, end_x):
         max_tip_length_to_length_ratio=5.0,
         max_stroke_width_to_length_ratio=100,
     )
+    # Manim positions the tip flush against the shaft's end rather than
+    # overlapping it, so the two separately-rendered shapes only just
+    # touch -- which shows up as a thin seam line at that boundary once
+    # compressed to video. Pulling the tip back very slightly along the
+    # arrow's own direction overlaps it onto the shaft instead, hiding
+    # the seam under solid tip fill (confirmed against a rendered frame:
+    # the seam is gone with this nudge, present without it).
+    tip_direction = arrow.tip.vector
+    tip_direction = tip_direction / np.linalg.norm(tip_direction)
+    arrow.tip.shift(-0.04 * tip_direction)
+    return arrow
 
 
 def flow_arrows(left_net_edge, right_net_edge, brace, code):
@@ -649,13 +668,22 @@ class RecursiveSelfImprovement(ThreeDScene):
         self.camera.background_color = BACKGROUND_COLOR
         self.set_camera_orientation(phi=0 * DEGREES, theta=-90 * DEGREES)
 
+        # One backdrop for the whole video, shared by both mini-movies --
+        # not recreated per part -- so neither part's ending has any
+        # reason to fade it out. Only the icosahedron finale's own camera
+        # move (see construct_main) still needs to fade it, since that's
+        # a real technical constraint (fixed-in-frame content misbehaves
+        # once the camera moves), not a stylistic choice.
+        backdrop = make_backdrop()
+        self.add_fixed_in_frame_mobjects(backdrop)
+
         # Mini-movie 1: a short, standalone taste of the same growth
         # pattern (net -> code -> bigger net) used throughout mini-movie
         # 2, then a beat of plain blank background as a hard cut between
         # the two, then mini-movie 2 -- the full chain -- runs unchanged.
         self.construct_intro()
         self.hold(1.0)
-        self.construct_main()
+        self.construct_main(backdrop)
 
     def construct_intro(self):
         """Mini-movie 1: one simple lap -- a small blue net grows in,
@@ -665,9 +693,6 @@ class RecursiveSelfImprovement(ThreeDScene):
         green-to-magenta progression, since this intro isn't actually
         part of that chain -- it's a self-contained preview of the same
         beat, not its first lap in disguise."""
-        backdrop = make_backdrop()
-        self.add_fixed_in_frame_mobjects(backdrop)
-
         m = SPEED_MULTIPLIERS[0]
 
         net0, nodes0, edges0, glow0 = build_net(
@@ -698,31 +723,24 @@ class RecursiveSelfImprovement(ThreeDScene):
         self.grow_in(nodes1, edges1, glow1, run_time=max(1.3 * m, 0.5))
         self.hold(0.5 * m)
 
+        # Each piece fades out on its own rather than as one synchronized
+        # block, and the backdrop stays put throughout -- so this reads
+        # as the scene's pieces settling away, not the whole picture
+        # (background glow included) dimming to black.
         self.play(
-            FadeOut(net0),
-            FadeOut(net1),
-            FadeOut(code),
-            FadeOut(brace),
-            FadeOut(left_arrow),
-            FadeOut(right_arrow),
-            FadeOut(backdrop),
-            run_time=max(1.0 * m, 0.45),
+            LaggedStart(
+                FadeOut(net0),
+                FadeOut(net1),
+                FadeOut(code),
+                FadeOut(brace),
+                FadeOut(left_arrow),
+                FadeOut(right_arrow),
+                lag_ratio=0.2,
+            ),
+            run_time=max(1.2 * m, 0.6),
         )
 
-    def construct_main(self):
-        # Fixed in frame rather than plain self.add(): a flat, ORIGIN-
-        # centered circle is part of the 3D scene like anything else, so
-        # once the camera tilts for the icosahedron reveal it would be
-        # seen edge-on and warp into an ellipse instead of staying a
-        # screen-space vignette. But fixed-in-frame content composites
-        # incorrectly (paints over, not under, everything else) the
-        # moment the camera actually moves -- a Manim/Cairo limitation,
-        # not a visual choice -- so it must be faded out no later than
-        # the start of the first camera move (see the FadeOut(backdrop)
-        # below) rather than left in place through the finale.
-        backdrop = make_backdrop()
-        self.add_fixed_in_frame_mobjects(backdrop)
-
+    def construct_main(self, backdrop):
         # Net 0 spawns on the left, green for its whole lifetime -- grown
         # in at the same unhurried pace as the first loop iteration below.
         current_net, current_nodes, current_edges, current_glow = build_net(
@@ -785,7 +803,7 @@ class RecursiveSelfImprovement(ThreeDScene):
         # same right-hand spot the others did.
         code = make_code_block(CODE_STAGE_FINAL, np.array([MID_X, 0, 0]))
         brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
-        ico_footprint_radius = 2.0
+        ico_footprint_radius = FINAL_STAGE_RADIUS
         left_arrow, right_arrow = flow_arrows(
             LEFT_X + current_radius, RIGHT_X - ico_footprint_radius, brace, code
         )
@@ -855,17 +873,31 @@ class RecursiveSelfImprovement(ThreeDScene):
             self.play(FadeOut(ico_group), run_time=1.5)
             self.hold(0.5)
         else:
-            # Finale skipped (INCLUDE_FINALE=0, the default): end on a
-            # clean fade of the last flat net and its code rather than
-            # cutting off mid-frame, so this stays a watchable clip on its
-            # own while the expensive 3D reveal is off.
-            self.hold(0.4 * FINAL_CODE_MULT)
+            # Finale skipped (INCLUDE_FINALE=0, the default): the right
+            # arrow still needs something to point at, so a final flat net
+            # grows in the same right-hand spot every earlier net did --
+            # red, like the icosahedron it stands in for -- at the same
+            # footprint radius already used to space the arrow above, so
+            # the arrow's tip meets its edge.
+            final_net, final_nodes, final_edges, final_glow = build_net(
+                center=np.array([RIGHT_X, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **FINAL_STAGE
+            )
+            self.grow_in(final_nodes, final_edges, final_glow, run_time=max(1.3 * FINAL_CODE_MULT, 0.5))
+            self.hold(0.6)
+
+            # Each piece fades out on its own rather than as one
+            # synchronized block, and the backdrop stays put throughout --
+            # so this reads as the scene's pieces settling away, not the
+            # whole picture (background glow included) dimming to black.
             self.play(
-                FadeOut(current_net),
-                FadeOut(code),
-                FadeOut(brace),
-                FadeOut(left_arrow),
-                FadeOut(right_arrow),
-                FadeOut(backdrop),
-                run_time=1.0,
+                LaggedStart(
+                    FadeOut(current_net),
+                    FadeOut(code),
+                    FadeOut(brace),
+                    FadeOut(left_arrow),
+                    FadeOut(right_arrow),
+                    FadeOut(final_net),
+                    lag_ratio=0.2,
+                ),
+                run_time=1.6,
             )
