@@ -1,72 +1,65 @@
-"""Visual style sandbox: 6 small (8-node) networks in a 3x2 grid, each
-built and animated with a different visual treatment, for comparing
-options against the look already used in recursive_self_improvement.py
-before committing to one for the main piece.
+"""Visual style sandbox, take 2: 6 small (8-node) networks in a 3x2 grid,
+all built from the *same* glowing-circle node/edge language already used
+in recursive_self_improvement.py (layered halo rings, a blurred glow
+blob underneath, thin lit edges) -- unlike the first pass at this file,
+none of these swap in a different node shape or drop the halo/blur look.
+Each cell instead just dials a different knob on that same look: a
+bigger/softer bloom, a breathing pulse, expanding sonar rings, a
+traveling comet, or an organic flicker.
 
 Cell layout (row, col):
-  (0,0) Glow Halo   -- the current recursive_self_improvement.py look,
-                        reused directly from that module: layered halo
-                        rings per node, a blurred silhouette glow blob
-                        underneath, gentle per-node drift.
-  (0,1) Pulse       -- flat core dot + a glow ring that breathes
-                        (radius/opacity oscillate), each node out of
-                        phase with its neighbors.
-  (0,2) Wireframe   -- unfilled ring nodes, dashed edges, the whole net
-                        slowly rotating as one rigid body.
-  (1,0) Particle    -- tiny bright node cores in a soft halo, plus a
-                        scattered field of small twinkling dust
-                        particles behind the net.
-  (1,1) Circuit     -- rounded-square "chip" nodes, right-angle elbowed
-                        traces instead of straight edges, and bright
-                        pulses that travel the traces on a loop.
-  (1,2) Rainbow     -- nodes colored across the hue wheel, edges
-                        gradient-colored between their endpoints, the
-                        whole palette slowly cycling hue over time.
+  (0,0) Glow Halo    -- unchanged baseline from recursive_self_improvement.py:
+                         layered halo rings, blurred glow blob, gentle drift.
+  (0,1) Soft Bloom   -- same nodes plus one extra big, very soft bloom
+                         circle behind each one, and a larger/softer
+                         glow blob -- a turned-up, dreamier version of
+                         the same halo.
+  (0,2) Pulse Core   -- same nodes, but each one's outer halo ring
+                         breathes (grows/brightens and shrinks/dims) on
+                         its own slow cycle, out of phase with its
+                         neighbors, while the core stays steady.
+  (1,0) Sonar Rings  -- same nodes, plus each one periodically sends out
+                         an expanding, fading ring -- like a soft radar
+                         ping -- staggered per node.
+  (1,1) Comet Edges  -- same nodes and edges, plus a small glowing comet
+                         that continuously travels each edge from one
+                         node to the other, fading in and out at the ends.
+  (1,2) Flicker Aura -- same nodes, but each halo's brightness flickers
+                         unevenly (summed random-phase sine waves, not a
+                         clean pulse) with occasional brighter flares --
+                         an organic, candle-like glow instead of a steady one.
 
 Run with:
     manim -pql visual_tests.py VisualStyleTests
 
-Set HOLD_SECONDS to change how long the grid sits still (idle
-animations keep running the whole time) before it fades out, e.g. for a
-quick look:
+Set HOLD_SECONDS to change how long the grid sits still (idle animations
+keep running the whole time) before it fades out, e.g. for a quick look:
     HOLD_SECONDS=3 manim -pql visual_tests.py VisualStyleTests
 """
 
-import colorsys
 import math
 import os
 import random
 
 import numpy as np
-from manim import (
-    DOWN,
-    Circle,
-    Dot,
-    DashedLine,
-    FadeIn,
-    FadeOut,
-    Group,
-    LaggedStart,
-    Line,
-    RoundedRectangle,
-    Scene,
-    Text,
-    VGroup,
-    VMobject,
-    config,
-)
+from manim import DOWN, Circle, FadeIn, FadeOut, Group, LaggedStart, Scene, Text, VGroup, config
 
 from recursive_self_improvement import (
-    BACKDROP_GLOW_COLOR,  # noqa: F401 (kept for parity with the source module)
     BACKGROUND_COLOR,
+    BLUE_EDGE,
+    BLUE_PALETTE,
     GREEN_EDGE,
     GREEN_PALETTE,
+    MAGENTA_EDGE,
+    MAGENTA_PALETTE,
+    PURPLE_EDGE,
+    PURPLE_PALETTE,
+    RED_EDGE,
+    RED_PALETTE,
+    TEAL_EDGE,
+    TEAL_PALETTE,
+    build_net,
     make_backdrop,
-    make_edge,
-    make_glow_blob,
-    make_node,
-    nearest_neighbor_edges,
-    sample_cloud,
 )
 
 config.pixel_width = 1920
@@ -83,248 +76,134 @@ NODE_RADIUS = 0.11
 COLS_X = [-4.5, 0.0, 4.5]
 ROWS_Y = [2.1, -2.1]
 
-PULSE_CORE = "#FFD9A0"
-PULSE_GLOW = "#FF8C42"
 
-WIREFRAME_COLOR = "#8FE3FF"
-
-PARTICLE_NODE_RADIUS = 0.075
-PARTICLE_CORE = "#FFFFFF"
-PARTICLE_GLOW = "#8FB8FF"
-
-CIRCUIT_NODE_SIZE = 0.16
-CIRCUIT_CORE = "#B6FFB0"
-CIRCUIT_GLOW = "#2FBE6A"
+# --- Soft Bloom: one extra, big, very soft circle behind each node -------
 
 
-def hue_to_hex(hue, sat=0.75, val=1.0):
-    r, g, b = colorsys.hsv_to_rgb(hue % 1.0, sat, val)
-    return "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
+def add_soft_bloom(node, radius, glow_color):
+    pos = node.get_center()
+    bloom = Circle(radius=radius * 7.0, stroke_width=0, fill_color=glow_color, fill_opacity=0.045).move_to(pos)
+    node.add_to_back(bloom)
 
 
-# --- Style 1: Glow Halo (the existing recursive_self_improvement.py look) --
+# --- Pulse Core: the halo ring breathes, the core stays steady -----------
 
 
-def build_glow_halo(center, seed):
-    points = sample_cloud(N_NODES, CLOUD_RADIUS, seed)
-    world_points = [center + p for p in points]
-    nodes_list = [make_node(p, NODE_RADIUS, GREEN_PALETTE) for p in world_points]
-    nodes = VGroup(*nodes_list)
-    edge_idx = nearest_neighbor_edges(points, K_NEIGHBORS)
-    edges = VGroup(*[make_edge(nodes_list[i], nodes_list[j], GREEN_EDGE) for i, j in edge_idx])
-    glow = make_glow_blob(points, edge_idx, CLOUD_RADIUS, NODE_RADIUS)
-    glow.move_to(center)
-    return Group(glow, edges, nodes)
-
-
-# --- Style 2: Pulse -- breathing glow rings, out of phase per node --------
-
-
-def add_pulse(node, ring, pos, phase, amplitude=0.32, speed=2.0):
+def add_pulse_breathe(node, amplitude=0.32, speed=1.6):
+    _outer, halo, _mid, _core = node
     state = {"t": random.uniform(0, 2 * math.pi), "scale": 1.0}
 
     def updater(mob, dt):
         state["t"] += dt * speed
-        wave = 0.5 + 0.5 * math.sin(state["t"] + phase)
+        wave = 0.5 + 0.5 * math.sin(state["t"])
         target_scale = 1.0 + amplitude * wave
-        ring.scale(target_scale / state["scale"], about_point=pos)
-        ring.set_stroke(opacity=0.3 + 0.5 * wave)
-        ring.set_fill(opacity=0.08 + 0.24 * wave)
+        halo.scale(target_scale / state["scale"], about_point=node.get_center())
+        halo.set_fill(opacity=0.14 + 0.3 * wave)
         state["scale"] = target_scale
 
     node.add_updater(updater)
 
 
-def build_pulse(center, seed):
-    points = sample_cloud(N_NODES, CLOUD_RADIUS, seed)
-    world_points = [center + p for p in points]
-    nodes = VGroup()
-    for p in world_points:
-        core = Circle(radius=NODE_RADIUS * 0.5, stroke_width=0, fill_color=PULSE_CORE, fill_opacity=1).move_to(p)
-        ring = Circle(
-            radius=NODE_RADIUS * 1.5, stroke_color=PULSE_GLOW, stroke_width=2, fill_color=PULSE_GLOW, fill_opacity=0.18
-        ).move_to(p)
-        node = VGroup(ring, core)
-        add_pulse(node, ring, p, phase=random.uniform(0, 2 * math.pi))
-        nodes.add(node)
-    edge_idx = nearest_neighbor_edges(points, K_NEIGHBORS)
-    edges = VGroup(
-        *[
-            Line(world_points[i], world_points[j], stroke_color=PULSE_GLOW, stroke_width=1.6, stroke_opacity=0.5)
-            for i, j in edge_idx
-        ]
-    )
-    return VGroup(edges, nodes)
+# --- Sonar Rings: each node periodically pings an expanding, fading ring -
 
 
-# --- Style 3: Wireframe -- outline nodes, dashed edges, rigid rotation ----
+def add_sonar_rings(node, base_radius, color, extras, count=2, period=2.6):
+    max_growth = base_radius * 4.2
+    for k in range(count):
+        ring = Circle(radius=base_radius, stroke_color=color, stroke_width=2, fill_opacity=0)
+        state = {"t": k * (period / count)}
 
-
-def make_wireframe_node(pos, radius, color):
-    ring = Circle(radius=radius * 1.3, stroke_color=color, stroke_width=1.6, fill_opacity=0).move_to(pos)
-    dot = Circle(radius=radius * 0.28, stroke_width=0, fill_color=color, fill_opacity=0.9).move_to(pos)
-    return VGroup(ring, dot)
-
-
-def build_wireframe(center, seed):
-    points = sample_cloud(N_NODES, CLOUD_RADIUS, seed)
-    world_points = [center + p for p in points]
-    nodes = VGroup(*[make_wireframe_node(p, NODE_RADIUS, WIREFRAME_COLOR) for p in world_points])
-    edge_idx = nearest_neighbor_edges(points, K_NEIGHBORS)
-    edges = VGroup(
-        *[
-            DashedLine(
-                world_points[i], world_points[j], stroke_color=WIREFRAME_COLOR, stroke_width=1.4, dash_length=0.08
+        def updater(mob, dt, state=state):
+            state["t"] += dt
+            progress = (state["t"] % period) / period
+            mob.become(
+                Circle(radius=base_radius + max_growth * progress, stroke_color=color, stroke_width=2, fill_opacity=0)
             )
-            for i, j in edge_idx
-        ]
-    )
-    group = VGroup(edges, nodes)
-    group.add_updater(lambda m, dt: m.rotate(dt * 0.35, about_point=center))
-    return group
+            mob.move_to(node.get_center())
+            mob.set_stroke(opacity=max(0.0, 1.0 - progress) * 0.55)
+
+        ring.add_updater(updater)
+        extras.add(ring)
 
 
-# --- Style 4: Particle -- tight bright cores + a twinkling dust field ----
+# --- Comet Edges: a small glowing dot travels each edge on a loop --------
 
 
-def make_dust(center, radius, count, color):
-    dust = VGroup()
-    for _ in range(count):
-        r = radius * random.uniform(0.3, 1.15)
-        theta = random.uniform(0, 2 * math.pi)
-        p = center + np.array([r * math.cos(theta), r * math.sin(theta), 0])
-        dot = Dot(point=p, radius=random.uniform(0.006, 0.018), color=color)
-        base_op = random.uniform(0.15, 0.5)
-        dot.set_opacity(base_op)
-        phase = random.uniform(0, 2 * math.pi)
-        speed = random.uniform(0.8, 2.0)
-        state = {"t": 0.0}
-
-        def updater(mob, dt, phase=phase, speed=speed, base_op=base_op, state=state):
-            state["t"] += dt * speed
-            mob.set_opacity(base_op * (0.3 + 0.7 * (0.5 + 0.5 * math.sin(state["t"] + phase))))
-
-        dot.add_updater(updater)
-        dust.add(dot)
-    return dust
-
-
-def build_particle(center, seed):
-    points = sample_cloud(N_NODES, CLOUD_RADIUS, seed)
-    world_points = [center + p for p in points]
-    nodes_list = []
-    for p in world_points:
-        core = Circle(
-            radius=PARTICLE_NODE_RADIUS * 0.6, stroke_width=0, fill_color=PARTICLE_CORE, fill_opacity=1
-        ).move_to(p)
-        halo = Circle(
-            radius=PARTICLE_NODE_RADIUS * 3.2, stroke_width=0, fill_color=PARTICLE_GLOW, fill_opacity=0.22
-        ).move_to(p)
-        nodes_list.append(VGroup(halo, core))
-    nodes = VGroup(*nodes_list)
-    edge_idx = nearest_neighbor_edges(points, K_NEIGHBORS)
-    edges = VGroup(
-        *[
-            Line(world_points[i], world_points[j], stroke_color=PARTICLE_GLOW, stroke_width=1.0, stroke_opacity=0.25)
-            for i, j in edge_idx
-        ]
-    )
-    dust = make_dust(center, CLOUD_RADIUS * 1.3, 45, PARTICLE_GLOW)
-    return VGroup(edges, nodes, dust)
-
-
-# --- Style 5: Circuit -- chip nodes, elbowed traces, traveling pulses ----
-
-
-def make_chip(pos, size, color_core, color_glow):
-    outer = RoundedRectangle(
-        corner_radius=0.03, width=size * 2.2, height=size * 2.2, stroke_width=0, fill_color=color_glow, fill_opacity=0.18
-    ).move_to(pos)
-    body = RoundedRectangle(
-        corner_radius=0.02, width=size * 1.3, height=size * 1.3, stroke_color=color_core, stroke_width=1.5,
-        fill_color=color_glow, fill_opacity=0.6
-    ).move_to(pos)
-    return VGroup(outer, body)
-
-
-def make_trace(a, b, color):
-    mid = np.array([b[0], a[1], 0])
-    path = VMobject(stroke_color=color, stroke_width=2)
-    path.set_points_as_corners([a, mid, b])
-    glow = path.copy().set_stroke(width=6, opacity=0.15)
-    return VGroup(glow, path)
-
-
-def add_traveling_pulse(path, color, period, phase):
-    dot = Dot(radius=0.05, color=color)
+def add_edge_comet(edge, color, extras, period, phase):
+    dot = Circle(radius=0.045, stroke_width=0, fill_color=color, fill_opacity=0.95)
+    glow = Circle(radius=0.1, stroke_width=0, fill_color=color, fill_opacity=0.35)
+    comet = VGroup(glow, dot)
     state = {"t": phase}
 
     def updater(mob, dt):
         state["t"] += dt
         prop = (state["t"] % period) / period
-        mob.move_to(path.point_from_proportion(prop))
+        a, b = edge.node_a.get_center(), edge.node_b.get_center()
+        mob.move_to(a + (b - a) * prop)
+        fade = min(1.0, prop * 6, (1 - prop) * 6)
+        glow.set_fill(opacity=0.35 * fade)
+        dot.set_fill(opacity=0.95 * fade)
 
-    dot.add_updater(updater)
-    return dot
-
-
-def build_circuit(center, seed):
-    points = sample_cloud(N_NODES, CLOUD_RADIUS, seed)
-    world_points = [center + p for p in points]
-    chips = VGroup(*[make_chip(p, CIRCUIT_NODE_SIZE, CIRCUIT_CORE, CIRCUIT_GLOW) for p in world_points])
-    edge_idx = nearest_neighbor_edges(points, K_NEIGHBORS)
-    traces = VGroup()
-    pulses = VGroup()
-    for i, j in edge_idx:
-        trace = make_trace(world_points[i], world_points[j], CIRCUIT_GLOW)
-        traces.add(trace)
-        pulses.add(add_traveling_pulse(trace[1], CIRCUIT_CORE, period=random.uniform(2.2, 3.6), phase=random.uniform(0, 3)))
-    return VGroup(traces, chips, pulses)
+    comet.add_updater(updater)
+    extras.add(comet)
 
 
-# --- Style 6: Rainbow -- hue-cycling nodes, gradient edges ----------------
+# --- Flicker Aura: organic, uneven brightness with occasional flares -----
 
 
-def make_rainbow_node(pos, radius, index, count):
-    halo = Circle(radius=radius * 1.9, stroke_width=0, fill_opacity=0.22).move_to(pos)
-    core = Circle(radius=radius * 0.55, stroke_width=1, fill_opacity=1).move_to(pos)
-    node = VGroup(halo, core)
-    state = {"t": random.uniform(0, 2 * math.pi)}
+def add_flicker(node, speed=1.0):
+    outer, halo, _mid, _core = node
+    freqs = [random.uniform(0.5, 1.4) for _ in range(3)]
+    phases = [random.uniform(0, 2 * math.pi) for _ in range(3)]
+    state = {"t": random.uniform(0, 10), "flare": 0.0}
 
     def updater(mob, dt):
-        state["t"] += dt
-        color = hue_to_hex((index / count + state["t"] * 0.05) % 1.0)
-        core.set_fill(color=color, opacity=1)
-        core.set_stroke(color=color)
-        halo.set_fill(color=color, opacity=0.22)
+        state["t"] += dt * speed
+        wobble = sum(math.sin(state["t"] * f + p) for f, p in zip(freqs, phases)) / 3
+        level = 0.6 + 0.4 * wobble
+        state["flare"] = max(0.0, state["flare"] - dt * 1.4)
+        if random.random() < dt * 0.15:
+            state["flare"] = 1.0
+        boost = 1.0 + 1.6 * state["flare"]
+        outer.set_fill(opacity=min(1.0, 0.10 * level * boost))
+        halo.set_fill(opacity=min(1.0, 0.28 * level * boost))
 
     node.add_updater(updater)
-    return node, core
 
 
-def build_rainbow(center, seed):
-    points = sample_cloud(N_NODES, CLOUD_RADIUS, seed)
-    world_points = [center + p for p in points]
-    count = len(world_points)
-    nodes_list = []
-    cores = []
-    for idx, p in enumerate(world_points):
-        node, core = make_rainbow_node(p, NODE_RADIUS, idx, count)
-        nodes_list.append(node)
-        cores.append(core)
-    nodes = VGroup(*nodes_list)
-    edge_idx = nearest_neighbor_edges(points, K_NEIGHBORS)
-    edges = VGroup()
-    for i, j in edge_idx:
-        line = Line(world_points[i], world_points[j], stroke_width=3)
-        edge = VGroup(line)
+def build_cell(center, seed, palette, edge_color, style):
+    net, nodes, edges, glow = build_net(
+        n_nodes=N_NODES,
+        cloud_radius=CLOUD_RADIUS,
+        k_neighbors=K_NEIGHBORS,
+        node_radius=NODE_RADIUS,
+        seed=seed,
+        center=center,
+        palette=palette,
+        edge_color=edge_color,
+    )
+    extras = VGroup()
 
-        def updater(mob, i=i, j=j, line=line):
-            line.set_color([cores[i].get_fill_color(), cores[j].get_fill_color()])
+    if style == "baseline":
+        pass
+    elif style == "bloom":
+        glow.scale(1.35)
+        for node in nodes:
+            add_soft_bloom(node, NODE_RADIUS, palette[2])
+    elif style == "pulse":
+        for node in nodes:
+            add_pulse_breathe(node)
+    elif style == "sonar":
+        for node in nodes:
+            add_sonar_rings(node, NODE_RADIUS, edge_color, extras)
+    elif style == "comet":
+        for edge in edges:
+            add_edge_comet(edge, palette[0], extras, period=random.uniform(1.8, 3.0), phase=random.uniform(0, 3))
+    elif style == "flicker":
+        for node in nodes:
+            add_flicker(node)
 
-        edge.add_updater(updater)
-        edges.add(edge)
-    return VGroup(edges, nodes)
+    return Group(net, extras)
 
 
 class VisualStyleTests(Scene):
@@ -334,19 +213,19 @@ class VisualStyleTests(Scene):
         self.add(backdrop)
 
         cells = [
-            (ROWS_Y[0], COLS_X[0], "Glow Halo", build_glow_halo),
-            (ROWS_Y[0], COLS_X[1], "Pulse", build_pulse),
-            (ROWS_Y[0], COLS_X[2], "Wireframe", build_wireframe),
-            (ROWS_Y[1], COLS_X[0], "Particle", build_particle),
-            (ROWS_Y[1], COLS_X[1], "Circuit", build_circuit),
-            (ROWS_Y[1], COLS_X[2], "Rainbow", build_rainbow),
+            (ROWS_Y[0], COLS_X[0], "Glow Halo", GREEN_PALETTE, GREEN_EDGE, "baseline"),
+            (ROWS_Y[0], COLS_X[1], "Soft Bloom", TEAL_PALETTE, TEAL_EDGE, "bloom"),
+            (ROWS_Y[0], COLS_X[2], "Pulse Core", BLUE_PALETTE, BLUE_EDGE, "pulse"),
+            (ROWS_Y[1], COLS_X[0], "Sonar Rings", PURPLE_PALETTE, PURPLE_EDGE, "sonar"),
+            (ROWS_Y[1], COLS_X[1], "Comet Edges", MAGENTA_PALETTE, MAGENTA_EDGE, "comet"),
+            (ROWS_Y[1], COLS_X[2], "Flicker Aura", RED_PALETTE, RED_EDGE, "flicker"),
         ]
 
         nets = []
         labels = []
-        for seed_offset, (y, x, name, builder) in enumerate(cells):
+        for seed_offset, (y, x, name, palette, edge_color, style) in enumerate(cells):
             center = np.array([x, y, 0])
-            nets.append(builder(center, seed=100 + seed_offset))
+            nets.append(build_cell(center, 100 + seed_offset, palette, edge_color, style))
             label = Text(name, font="Consolas", color="#B9C7DE").scale(0.34)
             label.move_to(center + DOWN * 1.55)
             labels.append(label)
