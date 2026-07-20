@@ -4,12 +4,18 @@ in recursive_self_improvement.py (layered halo rings, a blurred glow
 blob underneath, thin lit edges) -- unlike the first pass at this file,
 none of these swap in a different node shape or drop the halo/blur look.
 Each cell instead just dials a different knob on that same look: a
-bigger/softer bloom, a breathing pulse, expanding sonar rings, bloom
-plus an occasional pulse, or bloom that itself breathes.
+bigger/softer bloom, a breathing pulse, expanding sonar rings, chains of
+pulses hopping along edges, or bloom that itself breathes.
+
+Unlike recursive_self_improvement.py, nodes here sit perfectly still --
+that source file gives every node a small idle wander to read as
+"alive," but for a *neural* net specifically, that same wiggle reads as
+unsettling rather than lively, so it's stripped off right after
+build_net for every cell (see the comment in build_cell).
 
 Cell layout (row, col):
-  (0,0) Glow Halo     -- unchanged baseline from recursive_self_improvement.py:
-                          layered halo rings, blurred glow blob, gentle drift.
+  (0,0) Glow Halo     -- unchanged baseline from recursive_self_improvement.py
+                          (minus the drift): layered halo rings, blurred glow blob.
   (0,1) Soft Bloom    -- the node's own flat halo rings replaced with a
                           real blurred glow (gaussian raster, not stacked
                           opacity circles) behind a plain bright core.
@@ -21,8 +27,10 @@ Cell layout (row, col):
                           an expanding, fading ring -- like a soft radar
                           ping -- staggered per node.
   (1,1) Bloom Pulse   -- Soft Bloom's node/glow treatment, plus every so
-                          often (at random, not on a steady cycle) a ring
-                          expands out and fades over one of the nodes.
+                          often a chain of 3-5 pulses fires: one node
+                          pings, then an adjacent node (following an
+                          actual edge) 0.2s later, then another, hopping
+                          across the net instead of pinging independently.
   (1,2) Bloom Breathe -- Soft Bloom's node/glow treatment, but the glow
                           discs themselves continuously grow and shrink
                           -- Pulse Core's breathing motion applied to the
@@ -203,42 +211,127 @@ def add_sonar_rings(node, base_radius, color, extras, count=2, period=2.6):
         extras.add(ring)
 
 
-# --- Bloom Pulse: soft bloom nodes, plus an occasional ring passing over
-#     a node -- like Pulse Core's breathing ring, but a rare one-off event
-#     per node instead of something continuously breathing.
+# --- Bloom Pulse: soft bloom nodes, plus occasional chains of pulses --
+#     one node pings, then an adjacent node (following an actual edge),
+#     then another, 3-5 hops long with a fixed stagger between each hop
+#     -- rather than every node independently, randomly pinging on its
+#     own. Each ping spawns a brand-new ring mobject rather than
+#     reusing one ring per node, so a node that gets hit again while its
+#     last ring is still expanding gets a second, independent ring
+#     instead of the first one being cut off. Each ping also flashes
+#     that node's own mid ring white-hot for an instant before it fades
+#     back to its resting color, so the node itself visibly "fires" too.
 
 
-def add_occasional_pulse(node, base_radius, color, extras):
+def _lerp_hex(hex_a, hex_b, t):
+    a, b = _hex_to_rgb(hex_a), _hex_to_rgb(hex_b)
+    rgb = np.clip(a + (b - a) * t, 0, 255).astype(int)
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
+def spawn_pulse_ring(node, base_radius, color, extras, max_growth_mult=1.6, duration=2.0, peak_opacity=0.425):
     ring = Circle(radius=base_radius, stroke_color=color, stroke_width=2.4, fill_opacity=0)
-    max_growth = base_radius * 3.2
-    duration = 1.0
-    # Cooldowns tripled (both here and below) to bring pings down to
-    # roughly a third of their original frequency.
-    state = {"active": False, "t": 0.0, "cooldown": random.uniform(1.5, 12.0)}
+    ring.move_to(node.get_center())
+    max_growth = base_radius * max_growth_mult
+    state = {"t": 0.0}
 
     def updater(mob, dt):
-        if not state["active"]:
-            state["cooldown"] -= dt
-            mob.set_stroke(opacity=0)
-            if state["cooldown"] <= 0:
-                state["active"] = True
-                state["t"] = 0.0
-            return
         state["t"] += dt
         progress = state["t"] / duration
         if progress >= 1.0:
-            state["active"] = False
-            state["cooldown"] = random.uniform(4.5, 15.0)
-            mob.set_stroke(opacity=0)
+            extras.remove(mob)
+            mob.clear_updaters()
             return
         mob.become(
             Circle(radius=base_radius + max_growth * progress, stroke_color=color, stroke_width=2.4, fill_opacity=0)
         )
         mob.move_to(node.get_center())
-        mob.set_stroke(opacity=(1.0 - progress) * 0.85)
+        mob.set_stroke(opacity=(1.0 - progress) * peak_opacity)
 
     ring.add_updater(updater)
     extras.add(ring)
+
+
+def add_node_flash(node, rest_color, flash_color, duration=0.15):
+    """Snap the node's mid ring (index 0, after strip_halo_rings leaves
+    just [mid, core]) to flash_color the instant this fires, then ease
+    it back to rest_color over `duration` -- a quick white-hot flash
+    rather than a slow fade."""
+    mid = node[0]
+    state = {"active": False, "t": 0.0}
+
+    def updater(mob, dt):
+        if not state["active"]:
+            return
+        state["t"] += dt
+        progress = min(1.0, state["t"] / duration)
+        color = _lerp_hex(flash_color, rest_color, progress)
+        mid.set_fill(color=color)
+        mid.set_stroke(color=color)
+        if progress >= 1.0:
+            state["active"] = False
+
+    def trigger():
+        state["active"] = True
+        state["t"] = 0.0
+
+    node.add_updater(updater)
+    return trigger
+
+
+def add_pulse_chains(nodes, edges, base_radius, palette, extras, chain_stagger=0.2):
+    core_color, mid_color = palette[0], palette[1]
+    node_list = list(nodes)
+    index_of = {id(n): i for i, n in enumerate(node_list)}
+    adjacency = {i: [] for i in range(len(node_list))}
+    for edge in edges:
+        i, j = index_of[id(edge.node_a)], index_of[id(edge.node_b)]
+        adjacency[i].append(j)
+        adjacency[j].append(i)
+
+    flash_triggers = [add_node_flash(node, mid_color, core_color) for node in node_list]
+
+    def fire(idx):
+        spawn_pulse_ring(node_list[idx], base_radius, core_color, extras)
+        flash_triggers[idx]()
+
+    # queue holds [time_remaining, node_index] for hops still waiting to
+    # fire; cooldown counts down to the next chain once the queue drains.
+    state = {"cooldown": random.uniform(1.5, 6.0), "queue": []}
+
+    def scheduler(mob, dt):
+        pending = []
+        for delay, idx in state["queue"]:
+            delay -= dt
+            if delay <= 0:
+                fire(idx)
+            else:
+                pending.append([delay, idx])
+        state["queue"] = pending
+
+        if state["queue"]:
+            return
+        state["cooldown"] -= dt
+        if state["cooldown"] > 0:
+            return
+
+        length = random.randint(3, 5)
+        current = random.randrange(len(node_list))
+        path = [current]
+        visited = {current}
+        for _ in range(length - 1):
+            neighbors = adjacency[current]
+            if not neighbors:
+                break
+            unvisited = [n for n in neighbors if n not in visited]
+            current = random.choice(unvisited) if unvisited else random.choice(neighbors)
+            path.append(current)
+            visited.add(current)
+
+        state["queue"] = [[i * chain_stagger, idx] for i, idx in enumerate(path)]
+        state["cooldown"] = 0.5  # next chain starts 0.5s after this one's last hop fires
+
+    extras.add_updater(scheduler)
 
 
 def build_cell(center, seed, palette, edge_color, style):
@@ -252,6 +345,15 @@ def build_cell(center, seed, palette, edge_color, style):
         palette=palette,
         edge_color=edge_color,
     )
+    # build_net wires up a slow idle drift/wiggle on every node (meant to
+    # read as "alive" in recursive_self_improvement.py) -- dropped here
+    # since for a neural net specifically that reads as unsettling rather
+    # than lively. This is the only updater on a node at this point (edge
+    # updaters live on the edges, not the nodes), so clearing here can't
+    # catch any style-specific updater added below.
+    for node in nodes:
+        node.clear_updaters()
+
     extras = Group()
 
     if style == "baseline":
@@ -272,7 +374,7 @@ def build_cell(center, seed, palette, edge_color, style):
         for node in nodes:
             strip_halo_rings(node)
             add_soft_bloom(node, NODE_RADIUS, palette[2], extras)
-            add_occasional_pulse(node, NODE_RADIUS, palette[0], extras)
+        add_pulse_chains(nodes, edges, NODE_RADIUS, palette, extras)
         net.add_to_back(extras)
         return net
     elif style == "bloom_breathe":
@@ -315,6 +417,17 @@ class VisualStyleTests(Scene):
         )
 
         self.wait(HOLD_SECONDS)
+
+        # Bloom Pulse's chain scheduler keeps spawning/removing ring
+        # mobjects for as long as it has updaters -- if that's still
+        # happening *during* the FadeOut below, the animation's family
+        # snapshot (taken once at the start) stops matching the live
+        # mobject partway through and manim's zip() crashes. Freezing
+        # every updater first (recursively, so it reaches the scheduler
+        # on `extras` and any ring/flash updaters still in flight) stops
+        # that churn before the fade begins.
+        for n in nets:
+            n.clear_updaters()
 
         self.play(
             *[FadeOut(n) for n in nets],

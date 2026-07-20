@@ -190,14 +190,31 @@ def right_net_center(radius, code_right_edge):
     return right_facing_edge(code_right_edge) + radius
 
 
-def brace_left_for(code_lines):
-    """The brace-tip x a code block built from these lines would have,
-    without actually building the real (about-to-be-displayed) code/brace
-    for this lap -- used to look ahead at the *next* lap's geometry so a
-    net can be slid directly to where its next arrow will need it."""
+def code_edges_for(code_lines):
+    """The (code_right_edge, brace_left_edge) a code block built from
+    these lines would have if centered at MID_X, without building the
+    real (about-to-be-displayed) code/brace for this lap -- used both to
+    look ahead at a future lap's geometry and to solve lap_shift below."""
     code = make_code_block(code_lines, np.array([MID_X, 0, 0]))
     brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
-    return brace.get_left()[0]
+    return code.get_right()[0], brace.get_left()[0]
+
+
+def lap_shift(left_radius, right_radius, code_lines):
+    """The x-shift that re-centers a lap's whole composition (both nets,
+    code, brace, and arrows, moved together) so the screen keeps equal
+    margins on both sides -- solved directly from where the leftmost
+    (left net's outer edge) and rightmost (right net's outer edge) points
+    would land with the code sitting at plain MID_X, rather than assumed
+    to be a pure function of the two net radii. It isn't just that: the
+    brace reaches further left of the code than the code's plain edge
+    reaches right (there's no mirroring brace over there), so even two
+    equal-radius nets wouldn't quite balance without this correction."""
+    code_right_edge, brace_left_edge = code_edges_for(code_lines)
+    leftmost = left_net_center(left_radius, brace_left_edge) - left_radius
+    rightmost = right_net_center(right_radius, code_right_edge) + right_radius
+    return -(leftmost + rightmost) / 2
+
 
 # How far (and how fast) each node idly wanders from its own home spot.
 DRIFT_AMPLITUDE = 0.035
@@ -593,8 +610,31 @@ def make_code_block(lines, center):
     # Small and dense rather than legible-sized: this is meant to read as
     # a wall of real-looking code scrolling behind the bracket, not as
     # captions the viewer is expected to actually read line by line.
-    rows = VGroup(*[Text(line, font="Consolas", color=CODE_COLOR).scale(0.155) for line in lines])
+    #
+    # CODE_STAGE_* already carries real Python indentation as leading
+    # spaces, but Text()'s bounding box is based on rendered glyph ink,
+    # which a leading space contributes none of -- arranging rows with
+    # aligned_edge=LEFT (bounding-box edge to bounding-box edge) therefore
+    # silently discards it, flush-left regardless of how many spaces
+    # prefixed the string. Stripped here and re-applied as an explicit
+    # shift, in monospace character widths, after arranging -- measured
+    # from the gap between two known characters rather than a single
+    # glyph's own bounding box, which includes side bearing that would
+    # throw off the per-character width.
+    char_width = (
+        Text("00", font="Consolas", color=CODE_COLOR).scale(0.155).width
+        - Text("0", font="Consolas", color=CODE_COLOR).scale(0.155).width
+    )
+    rows = []
+    indents = []
+    for line in lines:
+        stripped = line.lstrip(" ")
+        indents.append(len(line) - len(stripped))
+        rows.append(Text(stripped, font="Consolas", color=CODE_COLOR).scale(0.155))
+    rows = VGroup(*rows)
     rows.arrange(DOWN, aligned_edge=LEFT, buff=0.075)
+    for row, indent in zip(rows, indents):
+        row.shift(np.array([indent * char_width, 0, 0]))
     rows.move_to(center)
     return rows
 
@@ -759,12 +799,13 @@ class RecursiveSelfImprovement(ThreeDScene):
 
         net0_radius = STAGES[0]["cloud_radius"]
         net1_radius = INTRO_END_STAGE["cloud_radius"]
+        shift = lap_shift(net0_radius, net1_radius, CODE_STAGE_1)
 
         # Built now (rather than after net0 grows in) purely to read its
         # geometry -- net0's position depends on where this code's brace
         # will sit, not the other way around. It isn't displayed until
         # the Write() below.
-        code = make_code_block(CODE_STAGE_1, np.array([MID_X, 0, 0]))
+        code = make_code_block(CODE_STAGE_1, np.array([MID_X + shift, 0, 0]))
         brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
 
         net0, nodes0, edges0, glow0 = build_net(
@@ -824,14 +865,24 @@ class RecursiveSelfImprovement(ThreeDScene):
         # instead of wherever this lap's different code would have put it.
         lap_code_lines = CODE_STAGES + [CODE_STAGE_FINAL]
 
+        # Every net radius in growth order, plus the radius that stands
+        # in for the icosahedron when the finale is skipped -- lap_radii[k]
+        # and lap_radii[k+1] are exactly the (left, right) pair of nets
+        # flanking lap (k+1) (or the final lap, for k=4). Known up front
+        # for the same reason as lap_code_lines: it lets lap_shift look
+        # ahead to a net's *next* lap, not just its current one.
+        lap_radii = [stage["cloud_radius"] for stage in STAGES] + [FINAL_STAGE_RADIUS]
+
         # Net 0 spawns on the left, green for its whole lifetime -- grown
         # in at the same unhurried pace as the first loop iteration below,
-        # already positioned for lap 1's own code so its arrow is exactly
-        # ARROW_LENGTH from the very first frame.
+        # already positioned for lap 1's own code (and shifted to keep lap
+        # 1's whole composition centered, since net 0 and lap 1's own
+        # right-hand net are almost never the same size) so its arrow is
+        # exactly ARROW_LENGTH from the very first frame.
+        shift = lap_shift(lap_radii[0], lap_radii[1], lap_code_lines[0])
+        _, brace_left0 = code_edges_for(lap_code_lines[0])
         current_net, current_nodes, current_edges, current_glow = build_net(
-            center=np.array(
-                [left_net_center(STAGES[0]["cloud_radius"], brace_left_for(lap_code_lines[0])), 0, 0]
-            ),
+            center=np.array([left_net_center(STAGES[0]["cloud_radius"], brace_left0 + shift), 0, 0]),
             palette=NET_PALETTES[0],
             edge_color=NET_EDGE_COLORS[0],
             **STAGES[0],
@@ -847,7 +898,8 @@ class RecursiveSelfImprovement(ThreeDScene):
         # early laps linger and later laps snap by increasingly fast.
         for i, (stage, code_lines, m) in enumerate(zip(STAGES[1:], CODE_STAGES, SPEED_MULTIPLIERS), start=1):
             stage_radius = stage["cloud_radius"]
-            code = make_code_block(code_lines, np.array([MID_X, 0, 0]))
+            shift = lap_shift(lap_radii[i - 1], lap_radii[i], code_lines)
+            code = make_code_block(code_lines, np.array([MID_X + shift, 0, 0]))
             brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
             left_arrow, right_arrow = flow_arrows(
                 left_facing_edge(brace.get_left()[0]), right_facing_edge(code.get_right()[0]), brace, code
@@ -874,7 +926,9 @@ class RecursiveSelfImprovement(ThreeDScene):
             self.hold(0.5 * m)
 
             stop_drift(next_nodes, next_edges)
-            new_left_center = left_net_center(stage_radius, brace_left_for(lap_code_lines[i]))
+            next_shift = lap_shift(lap_radii[i], lap_radii[i + 1], lap_code_lines[i])
+            _, next_brace_left = code_edges_for(lap_code_lines[i])
+            new_left_center = left_net_center(stage_radius, next_brace_left + next_shift)
             slide_shift = new_left_center - right_net_center(stage_radius, code.get_right()[0])
             self.play(
                 FadeOut(current_net),
@@ -895,7 +949,8 @@ class RecursiveSelfImprovement(ThreeDScene):
         # but what grows in its place isn't another flat net -- it's the
         # icosahedron, red, still viewed face-on so it grows in at the
         # same right-hand spot the others did.
-        code = make_code_block(CODE_STAGE_FINAL, np.array([MID_X, 0, 0]))
+        shift = lap_shift(lap_radii[4], lap_radii[5], CODE_STAGE_FINAL)
+        code = make_code_block(CODE_STAGE_FINAL, np.array([MID_X + shift, 0, 0]))
         brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
         ico_footprint_radius = FINAL_STAGE_RADIUS
         ico_center_x = right_net_center(ico_footprint_radius, code.get_right()[0])
