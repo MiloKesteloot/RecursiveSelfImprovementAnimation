@@ -78,6 +78,7 @@ from manim import (
     Wait,
     Write,
     config,
+    linear,
 )
 
 # Fixed at 1920x1080 regardless of manim's own -ql/-qm/-qh flags -- those
@@ -555,6 +556,34 @@ CODE_STAGES = [
     CODE_STAGE_6,
     CODE_STAGE_7,
 ]
+
+# Every code block -- 6 lines or 42 -- writes itself in the same fixed
+# time budget CODE_STAGE_1 (the very first block the video ever shows)
+# always has, scaled by that lap's own multiplier same as every other
+# beat -- rather than more text simply taking longer to type, which used
+# to make the final, biggest blocks the slowest instead of the fastest.
+# Held fixed here at CODE_STAGE_1's own row count/lag_ratio rather than
+# recomputed per block, so every other block's write_code() call below
+# can derive both a target total time *and* a fixed per-row pace from
+# it: extra rows past CODE_STAGE_1's own count write in parallel (a
+# shrinking lag_ratio between row starts) instead of every row revealing
+# faster, since it's meant to read as a fast AI writing many lines at
+# once, not as one line whose reveal sped up.
+CODE_WRITE_LAG_RATIO = 0.3
+_CODE_WRITE_REF_LINES = len(CODE_STAGE_1)
+_CODE_WRITE_REF_SPAN = 1 + CODE_WRITE_LAG_RATIO * (_CODE_WRITE_REF_LINES - 1)
+
+
+def write_code(code, m):
+    """A LaggedStart writing every row of `code`, budgeted to finish in
+    CODE_STAGE_1's own total time (scaled by this lap's multiplier m)
+    regardless of how many rows `code` actually has -- see
+    CODE_WRITE_LAG_RATIO above."""
+    n = len(code)
+    target = (0.5 + 0.16 * _CODE_WRITE_REF_LINES) * m
+    per_row = target / _CODE_WRITE_REF_SPAN
+    lag_ratio = (_CODE_WRITE_REF_SPAN - 1) / max(n - 1, 1)
+    return LaggedStart(*[Write(row, run_time=per_row) for row in code], lag_ratio=lag_ratio)
 
 
 def _lap_code_span(code_lines):
@@ -1543,30 +1572,23 @@ class RecursiveSelfImprovement(ThreeDScene):
             wait_time = delay_frac * run_time * 0.7
             edge_fade_ins.append(Succession(Wait(wait_time), FadeIn(edge, run_time=run_time - wait_time)))
 
-        if os.environ.get("DEBUG_GLOW", "0") == "1":
-            state = {"t": 0.0}
-            first_edge = edges_group[0] if len(edges_group) else None
-
-            def _dbg(mob, dt):
-                state["t"] += dt
-                print(
-                    f"t={state['t']:.3f} glow_op={glow.get_opacity():.3f} "
-                    f"extras_op={extras[0].get_opacity():.3f} "
-                    f"node_w={node_list[-1].width:.4f} "
-                    f"edge_op={(first_edge.get_stroke_opacity() if first_edge is not None else -1):.3f}"
-                )
-
-            glow.add_updater(_dbg)
-
+        # glow/extras fade in linearly rather than manim's default easing --
+        # the raster bloom discs don't track that ease-in-out curve's
+        # asymptotic final approach as tightly as the vector nodes/edges do,
+        # so easing left them visibly still for the last few frames before
+        # snapping to their exact end state the instant this self.play()
+        # call finishes (confirmed by diffing consecutive rendered frames:
+        # a one-frame brightness pop right at each node's halo, timed to
+        # the literal end of this animation). Linear keeps them visibly
+        # brightening right up to that last frame, so the snap blends into
+        # motion already in progress instead of interrupting a standstill.
         self.play(
-            FadeIn(glow),
-            FadeIn(extras),
+            FadeIn(glow, rate_func=linear),
+            FadeIn(extras, rate_func=linear),
             AnimationGroup(*edge_fade_ins),
             LaggedStart(*[GrowFromCenter(n) for n in node_list], lag_ratio=0.04),
             run_time=run_time,
         )
-        if os.environ.get("DEBUG_GLOW", "0") == "1":
-            glow.clear_updaters()
         # Not started any earlier than this -- a ping firing on a net
         # that's still forming would read as broken, not alive.
         if not SIMPLE_STYLE:
@@ -1631,9 +1653,7 @@ class RecursiveSelfImprovement(ThreeDScene):
 
         self.play(grow_arrow(left_arrow), run_time=0.5 * m)
         self.play(
-            LaggedStart(
-                *[Write(row) for row in code], lag_ratio=0.3, run_time=(0.5 + 0.16 * len(CODE_STAGE_1)) * m
-            ),
+            write_code(code, m),
             GrowFromCenter(brace, run_time=0.35 * m),
         )
         self.hold(0.4 * m)
@@ -1731,9 +1751,7 @@ class RecursiveSelfImprovement(ThreeDScene):
 
             self.play(grow_arrow(left_arrow), run_time=0.5 * m)
             self.play(
-                LaggedStart(
-                    *[Write(row) for row in code], lag_ratio=0.3, run_time=(0.5 + 0.16 * len(code_lines)) * m
-                ),
+                write_code(code, m),
                 GrowFromCenter(brace, run_time=0.35 * m),
             )
             self.hold(0.4 * m)
@@ -1812,11 +1830,7 @@ class RecursiveSelfImprovement(ThreeDScene):
 
         self.play(grow_arrow(left_arrow), run_time=0.5 * FINAL_CODE_MULT)
         self.play(
-            LaggedStart(
-                *[Write(row) for row in code],
-                lag_ratio=0.3,
-                run_time=(0.5 + 0.16 * len(CODE_STAGE_FINAL)) * FINAL_CODE_MULT,
-            ),
+            write_code(code, FINAL_CODE_MULT),
             GrowFromCenter(brace, run_time=0.35 * FINAL_CODE_MULT),
         )
         self.hold(0.4 * FINAL_CODE_MULT)
