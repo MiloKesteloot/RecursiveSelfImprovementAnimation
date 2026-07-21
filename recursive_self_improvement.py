@@ -78,7 +78,6 @@ from manim import (
     Wait,
     Write,
     config,
-    linear,
 )
 
 # Fixed at 1920x1080 regardless of manim's own -ql/-qm/-qh flags -- those
@@ -1572,19 +1571,9 @@ class RecursiveSelfImprovement(ThreeDScene):
             wait_time = delay_frac * run_time * 0.7
             edge_fade_ins.append(Succession(Wait(wait_time), FadeIn(edge, run_time=run_time - wait_time)))
 
-        # glow/extras fade in linearly rather than manim's default easing --
-        # the raster bloom discs don't track that ease-in-out curve's
-        # asymptotic final approach as tightly as the vector nodes/edges do,
-        # so easing left them visibly still for the last few frames before
-        # snapping to their exact end state the instant this self.play()
-        # call finishes (confirmed by diffing consecutive rendered frames:
-        # a one-frame brightness pop right at each node's halo, timed to
-        # the literal end of this animation). Linear keeps them visibly
-        # brightening right up to that last frame, so the snap blends into
-        # motion already in progress instead of interrupting a standstill.
         self.play(
-            FadeIn(glow, rate_func=linear),
-            FadeIn(extras, rate_func=linear),
+            FadeIn(glow),
+            FadeIn(extras),
             AnimationGroup(*edge_fade_ins),
             LaggedStart(*[GrowFromCenter(n) for n in node_list], lag_ratio=0.04),
             run_time=run_time,
