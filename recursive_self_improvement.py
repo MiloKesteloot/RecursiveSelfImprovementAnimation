@@ -122,6 +122,12 @@ INCLUDE_FINALE = os.environ.get("INCLUDE_FINALE", "0") == "1"
 # beat without paying for the rest of the video too.
 INTRO_ONLY = os.environ.get("INTRO_ONLY", "0") == "1"
 
+# Set MAIN_ONLY=1 to render just mini-movie 2 (construct_main) -- the
+# full chain -- skipping mini-movie 1's own standalone intro lap and the
+# blank-cut hold in between, for iterating on (or rendering) the main
+# chain alone without paying for the intro too.
+MAIN_ONLY = os.environ.get("MAIN_ONLY", "0") == "1"
+
 # Set SIMPLE_STYLE=1 to strip every node down to one flat circle and every
 # edge down to one flat line -- no glow discs, no glow blob, no pulse-chain
 # animation. Purely a profiling stand-in to isolate how much of the render
@@ -338,12 +344,14 @@ def lap_shift(left_radius, right_radius, code_lines):
 # make_code_block) -- dense enough that it reads as "real code scrolling
 # by," not as something the viewer is meant to actually read.
 CODE_STAGE_1 = [
-    "import torch",
+    "net = TinyNet(num_layers=4)",
+    "optimizer = SGD(net.parameters(), lr=1e-3)",
     "for x_batch, y in loader:",
     "    logits = net(x_batch)",
     "    loss = F.cross_entropy(logits, y)",
     "    loss.backward()",
     "    optimizer.step()",
+    "scheduler.step()",
 ]
 
 CODE_STAGE_2 = [
@@ -821,8 +829,26 @@ def make_backdrop():
     concentric circles (even dozens, at tiny opacity each) always shows a
     visible ring at every boundary radius, since alpha-compositing discs
     is still a step function -- only a true per-pixel gradient, rendered
-    as a raster image here, is actually smooth."""
-    resolution = 480
+    as a raster image here, is actually smooth.
+
+    Smooth in exact math still isn't smooth once it's quantized to 8-bit
+    channels and stretched, though: BACKGROUND_COLOR -> BACKDROP_GLOW_COLOR
+    only spans ~50 levels of blue over the whole radius, so with nothing
+    to break the quantization up, huge bands of pixels round to the exact
+    same integer color and show up as visible rings -- the same step-
+    function problem raster-rendering this was meant to avoid in the
+    first place, just moved from "alpha compositing" to "8-bit rounding"
+    as its cause. resolution is matched to the actual output pixel height
+    (not a smaller value stretched up) so upscaling blockiness can't add
+    still more banding of its own, and a small per-pixel dither is added
+    before rounding -- some pixels a band "should" round down round up
+    instead (and vice versa), which turns each hard edge into a soft,
+    visually-smooth transition instead of a sharp ring. Seeded rather
+    than left nondeterministic since this backdrop is built once and
+    reused for the whole video, not regenerated per frame, where an
+    unseeded dither would otherwise crawl/shimmer across frames if this
+    ever did get called more than once."""
+    resolution = config.pixel_height
     aspect = config.frame_width / config.frame_height
     width_px = int(resolution * aspect)
     ys, xs = np.mgrid[0:resolution, 0:width_px]
@@ -835,7 +861,9 @@ def make_backdrop():
 
     bg = _hex_to_rgb(BACKGROUND_COLOR)
     glow = _hex_to_rgb(BACKDROP_GLOW_COLOR)
-    rgb = (bg + (glow - bg) * t[:, :, None]).astype(np.uint8)
+    rgb_f = bg + (glow - bg) * t[:, :, None]
+    dither = np.random.default_rng(0).uniform(-0.5, 0.5, size=rgb_f.shape)
+    rgb = np.clip(np.round(rgb_f + dither), 0, 255).astype(np.uint8)
     alpha = np.full((*t.shape, 1), 255, dtype=np.uint8)
     rgba = np.concatenate([rgb, alpha], axis=2)
 
@@ -1017,7 +1045,11 @@ def add_pulse_chains(nodes_group, edges_group, base_radius, palette, extras, cha
     FLASH_DELAY = 0.1
 
     def fire(idx):
-        spawn_pulse_ring(node_list[idx], base_radius, core_color, extras)
+        # SIMPLE_STYLE keeps the flash (a node lighting up) but skips the
+        # expanding ring -- this render pass wants pings to read as "the
+        # node flashes," not the ring's own separate growth/fade.
+        if not SIMPLE_STYLE:
+            spawn_pulse_ring(node_list[idx], base_radius, core_color, extras)
         state["flash_queue"].append([FLASH_DELAY, idx])
 
     # queue holds [time_remaining, node_index] for hops still waiting to
@@ -1074,21 +1106,34 @@ def add_pulse_chains(nodes_group, edges_group, base_radius, palette, extras, cha
     extras.add_updater(scheduler)
 
 
-def stop_effects(extras):
-    """Freeze this net's bloom-disc tracking and pulse scheduler, and
-    drop any pulse ring still mid-flight, rather than merely suspending
-    them -- .suspend_updating() turned out not to be enough: even
-    suspended, an attached updater somehow still left a following
-    net.animate.shift() silently unable to move the mobject (proven by
-    an isolated test: identical shift, .suspend_updating() -> no
-    movement, .clear_updaters() -> moves correctly). Call before any
-    animation that repositions a net. In-flight rings are actually
-    removed (not just paused) since a paused one would otherwise sit
-    frozen on screen forever with no updater left to finish fading it."""
+def stop_effects(extras, remove_rings=True):
+    """Freeze this net's bloom-disc tracking and pulse scheduler --
+    .suspend_updating() turned out not to be enough: even suspended, an
+    attached updater somehow still left a following net.animate.shift()
+    silently unable to move the mobject (proven by an isolated test:
+    identical shift, .suspend_updating() -> no movement,
+    .clear_updaters() -> moves correctly). Call before any animation
+    that repositions OR fades out a net -- either way, clearing the
+    Group's own scheduler updater stops any *new* pulse ring/flash from
+    firing from this point on.
+
+    remove_rings (default True) additionally drops any pulse ring still
+    mid-flight, rather than leaving it in place -- for a net about to be
+    repositioned and reused (slid into the next lap's left slot, kept
+    alive by resume_effects right after), a ring left behind would
+    freeze at whatever partial radius/opacity it had reached (its own
+    growth/fade was driven by its updater, just cleared) and then sit on
+    screen like that for the rest of the video, since nothing continues
+    animating it. Pass remove_rings=False for a net about to fade out
+    for good instead (see every other stop_effects call site) -- there,
+    the ring freezing in place is fine, since the very next thing that
+    happens is a FadeOut sweeping whatever's left in extras, ring
+    included, to opacity 0 right along with everything else, rather than
+    the ring vanishing on its own a beat before the net around it does."""
     extras.clear_updaters()
     for mob in list(extras):
         mob.clear_updaters()
-        if isinstance(mob, Circle):
+        if remove_rings and isinstance(mob, Circle):
             extras.remove(mob)
 
 
@@ -1098,8 +1143,7 @@ def resume_effects(extras, nodes_group, edges_group, node_radius, palette):
     into the left slot)."""
     for disc in extras:
         disc.add_updater(lambda mob: mob.move_to(mob.tracked_node.get_center()))
-    if not SIMPLE_STYLE:
-        add_pulse_chains(nodes_group, edges_group, node_radius, palette, extras)
+    add_pulse_chains(nodes_group, edges_group, node_radius, palette, extras)
 
 
 def make_node(pos, radius, palette):
@@ -1278,7 +1322,37 @@ def _point_blocks_segment(point, a, b, threshold):
     return np.linalg.norm(point - closest) < threshold
 
 
-def nearest_neighbor_edges(points, k, node_radius, block_margin=1.2):
+def _segment_crosses_box(a, b, box):
+    """Whether the a-b segment enters the axis-aligned box (x0, x1, y0,
+    y1) anywhere along its length -- not just whether either endpoint
+    sits inside it, so an edge that merely passes *through* the box
+    (both endpoints outside, on opposite sides) still counts. Standard
+    Liang-Barsky segment/rectangle clip: walk the segment's parameter
+    range t in [0, 1] down to whatever sub-range satisfies all four of
+    the box's half-plane constraints at once; a non-empty range left at
+    the end means some point on the segment satisfies all four
+    simultaneously, i.e. sits inside the box."""
+    x0, x1, y0, y1 = box
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    t_min, t_max = 0.0, 1.0
+    for p, q in ((-dx, a[0] - x0), (dx, x1 - a[0]), (-dy, a[1] - y0), (dy, y1 - a[1])):
+        if p == 0:
+            if q < 0:
+                return False
+        else:
+            t = q / p
+            if p < 0:
+                if t > t_max:
+                    return False
+                t_min = max(t_min, t)
+            else:
+                if t < t_min:
+                    return False
+                t_max = min(t_max, t)
+    return t_min <= t_max
+
+
+def nearest_neighbor_edges(points, k, node_radius, block_margin=1.2, keep_out=None):
     """Each point connects to its k nearest neighbors (deduplicated) --
     a dense but locally-organized mesh, matching the reference nets'
     web-like (not fully-connected) look. A candidate edge is skipped (the
@@ -1289,7 +1363,16 @@ def nearest_neighbor_edges(points, k, node_radius, block_margin=1.2):
     now uses), the two outer nodes' edge visually cuts across the middle
     one despite there being no real edge to it. block_margin pads
     node_radius slightly (rather than using it bare) so an edge merely
-    grazing a node's outer rim still counts as blocked."""
+    grazing a node's outer rim still counts as blocked.
+
+    keep_out, if given, is an (x0, x1, y0, y1) box (see FINAL_STAGE's own
+    arrow-clearance box, built in build_net) that no edge is allowed to
+    cross either, on top of the node-blocking check above -- otherwise
+    two nodes that are each other's nearest neighbor by raw distance but
+    sit on opposite sides of whatever occupies that box (FINAL_STAGE's
+    own arrow, which -- unlike every other node -- can't ever block a
+    segment on its own, since it isn't a point in `points` to begin
+    with) get connected straight through it."""
     threshold = node_radius * block_margin
     edges = set()
     for i, p in enumerate(points):
@@ -1302,6 +1385,8 @@ def nearest_neighbor_edges(points, k, node_radius, block_margin=1.2):
                 m != i and m != j and _point_blocks_segment(points[m], p, points[j], threshold)
                 for m in range(len(points))
             )
+            if not blocked and keep_out is not None:
+                blocked = _segment_crosses_box(p, points[j], keep_out)
             if blocked:
                 continue
             edges.add(tuple(sorted((i, j))))
@@ -1392,7 +1477,7 @@ def _components_excluding_node(n, adjacency, removed):
     return components
 
 
-def _ensure_two_vertex_connected(points, edges, node_radius, block_margin=1.2, top_k=15):
+def _ensure_two_vertex_connected(points, edges, node_radius, block_margin=1.2, top_k=15, keep_out=None):
     """Adds edges (never removes any) until the net has no cut vertices
     left -- every pair of nodes ends up with two independent paths that
     share no *nodes* in common (not just no shared edge), so there's
@@ -1414,13 +1499,25 @@ def _ensure_two_vertex_connected(points, edges, node_radius, block_margin=1.2, t
     few hundred points); only the top_k nearest candidates then pay for
     the O(n) occlusion check, rather than every pair in the (possibly
     large) cross product -- the nearest candidate passes that check
-    often enough that this stays fast even on FINAL_STAGE's 432 nodes."""
+    often enough that this stays fast even on FINAL_STAGE's 432 nodes.
+
+    keep_out is forwarded to `blocked` unchanged from nearest_neighbor_
+    edges' own parameter of the same name -- see its docstring. Without
+    this, a cross-piece pair straddling FINAL_STAGE's own arrow (its two
+    pieces disconnected, or reconnected only through a cut vertex,
+    specifically because nothing is allowed to cross that gap) is
+    exactly the scenario this function exists to fix, and it would
+    "fix" it by drawing an edge straight through the arrow -- the one
+    thing every other candidate edge in this net is already forbidden
+    from doing."""
     n = len(points)
     points_arr = np.array(points)
     threshold = node_radius * block_margin
     edges = set(edges)
 
     def blocked(a, b):
+        if keep_out is not None and _segment_crosses_box(points_arr[a], points_arr[b], keep_out):
+            return True
         return any(
             m != a and m != b and _point_blocks_segment(points_arr[m], points_arr[a], points_arr[b], threshold)
             for m in range(n)
@@ -1529,8 +1626,26 @@ def build_net(
 
     nodes_list = [make_node(p, node_radius, palette) for p in points]
     nodes_group = VGroup(*nodes_list)
-    edge_indices = nearest_neighbor_edges(local_points, k_neighbors, node_radius)
-    edge_indices = _ensure_two_vertex_connected(local_points, edge_indices, node_radius)
+    # shape="parabola" nets (FINAL_STAGE only) sit right up against their
+    # own arrow, with the pinch point at local (0, 0) -- and, unlike every
+    # other node an edge might cut through, the arrow itself never appears
+    # in local_points to naturally block a segment via the nodes_list loop
+    # above, since it isn't a node. keep_out is that arrow's own
+    # silhouette in this same local coordinate system (see make_arrow/
+    # flow_arrows for GAP, ARROW_LENGTH, ARROW_TIP_HALF_HEIGHT -- the
+    # constants that place and size it), padded the same way
+    # _point_blocks_segment pads a node, so an edge can't even graze it.
+    keep_out = None
+    if shape == "parabola":
+        margin = node_radius * 1.2
+        keep_out = (
+            -(ARROW_LENGTH + GAP) - margin,
+            -GAP + margin,
+            -ARROW_TIP_HALF_HEIGHT - margin,
+            ARROW_TIP_HALF_HEIGHT + margin,
+        )
+    edge_indices = nearest_neighbor_edges(local_points, k_neighbors, node_radius, keep_out=keep_out)
+    edge_indices = _ensure_two_vertex_connected(local_points, edge_indices, node_radius, keep_out=keep_out)
     edges_group = VGroup(*[make_edge(nodes_list[i], nodes_list[j], edge_color) for i, j in edge_indices])
 
     if SIMPLE_STYLE:
@@ -1708,9 +1823,10 @@ class RecursiveSelfImprovement(ThreeDScene):
             run_time=run_time,
         )
         # Not started any earlier than this -- a ping firing on a net
-        # that's still forming would read as broken, not alive.
-        if not SIMPLE_STYLE:
-            add_pulse_chains(nodes_group, edges_group, node_radius, palette, extras)
+        # that's still forming would read as broken, not alive. Runs
+        # under SIMPLE_STYLE too -- see fire()'s own SIMPLE_STYLE check,
+        # which keeps the flash but drops the expanding ring.
+        add_pulse_chains(nodes_group, edges_group, node_radius, palette, extras)
 
     def construct(self):
         self.camera.background_color = BACKGROUND_COLOR
@@ -1729,10 +1845,11 @@ class RecursiveSelfImprovement(ThreeDScene):
         # pattern (net -> code -> bigger net) used throughout mini-movie
         # 2, then a beat of plain blank background as a hard cut between
         # the two, then mini-movie 2 -- the full chain -- runs unchanged.
-        self.construct_intro()
-        if INTRO_ONLY:
-            return
-        self.hold(1.0)
+        if not MAIN_ONLY:
+            self.construct_intro()
+            if INTRO_ONLY:
+                return
+            self.hold(1.0)
         self.construct_main(backdrop)
 
     def construct_intro(self):
@@ -1796,8 +1913,12 @@ class RecursiveSelfImprovement(ThreeDScene):
         # either would keep mutating its extras mid-FadeOut and crash
         # manim's interpolation ("zip() argument 2 is shorter than
         # argument 1", confirmed against an actual full render).
-        stop_effects(extras0)
-        stop_effects(extras1)
+        # remove_rings=False on both -- these nets are fading out for
+        # good, not being reused, so any pulse ring still mid-flight
+        # should fade out along with everything else in the FadeOut
+        # below, rather than vanishing on its own a beat early.
+        stop_effects(extras0, remove_rings=False)
+        stop_effects(extras1, remove_rings=False)
         self.play(
             LaggedStart(
                 FadeOut(net0),
@@ -1888,6 +2009,11 @@ class RecursiveSelfImprovement(ThreeDScene):
             )
             self.hold(0.5 * m)
 
+            # next_extras keeps its default remove_rings=True -- next_net
+            # is about to slide, not fade, and lives on as current_net
+            # for the lap after this one, so a ring left mid-flight here
+            # would freeze in place and sit on screen for the rest of
+            # the video instead of ever finishing.
             stop_effects(next_extras)
             # current_net's own pulse scheduler is still live too -- left
             # running, it keeps adding/removing pulse-ring mobjects into
@@ -1895,8 +2021,11 @@ class RecursiveSelfImprovement(ThreeDScene):
             # changing current_net's family size mid-animation and
             # crashing manim's interpolation (confirmed: "zip() argument
             # 2 is shorter than argument 1"). No resume_effects needed
-            # afterward -- current_net is being discarded, not reused.
-            stop_effects(current_extras)
+            # afterward -- current_net is being discarded, not reused, so
+            # remove_rings=False: any ring still mid-flight fades out
+            # with the rest of it in the FadeOut below instead of
+            # vanishing on its own a beat early.
+            stop_effects(current_extras, remove_rings=False)
             # The lap right after this one is the final, deliberately-
             # overflowing net -- centering the composition around it
             # would try to drag everything sideways to "balance" a net
@@ -1996,8 +2125,11 @@ class RecursiveSelfImprovement(ThreeDScene):
             # current_net's pulse scheduler is stopped first -- left
             # running, it would keep mutating current_extras mid-FadeOut
             # and crash manim's interpolation (see the other stop_effects
-            # call in the main loop for the confirmed error).
-            stop_effects(current_extras)
+            # call in the main loop for the confirmed error). remove_
+            # rings=False: current_net is fading out for good here, so
+            # any ring still mid-flight fades with it instead of
+            # vanishing on its own a beat early.
+            stop_effects(current_extras, remove_rings=False)
             ico_group = VGroup(ico_glow, ico_vertices, ico_edges)
             self.play(
                 FadeOut(current_net),
@@ -2041,9 +2173,12 @@ class RecursiveSelfImprovement(ThreeDScene):
             # Both nets' pulse schedulers are stopped first -- left
             # running, either would keep mutating its extras mid-FadeOut
             # and crash manim's interpolation (see the other stop_effects
-            # calls above for the confirmed error).
-            stop_effects(current_extras)
-            stop_effects(final_extras)
+            # calls above for the confirmed error). remove_rings=False on
+            # both -- both nets are fading out for good here, so any ring
+            # still mid-flight fades with them instead of vanishing on
+            # its own a beat early.
+            stop_effects(current_extras, remove_rings=False)
+            stop_effects(final_extras, remove_rings=False)
             self.play(
                 LaggedStart(
                     FadeOut(current_net),
