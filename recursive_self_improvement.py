@@ -136,6 +136,17 @@ SIMPLE_STYLE = os.environ.get("SIMPLE_STYLE", "0") == "1"
 # nets with a lot of nodes without also paying to rasterize every node.
 EDGES_ONLY = os.environ.get("EDGES_ONLY", "0") == "1"
 
+# Set INSTANT=1 to make every self.play() resolve in a single frame
+# instead of actually animating -- for a pure "is the layout right" pass
+# where the growing/writing/sliding motion isn't what's being checked,
+# only the resulting composition at each beat is. See RecursiveSelfImprovement.play
+# below: every animation still runs its own rate_func end-to-end (so it
+# still lands in its real, fully-settled final state, not a half-played
+# one), it just does so within one rendered frame instead of its
+# scripted duration. hold() is untouched, so there's still a beat to
+# actually look at each resulting layout.
+INSTANT = os.environ.get("INSTANT", "0") == "1"
+
 BACKGROUND_COLOR = "#0A1830"
 BACKDROP_GLOW_COLOR = "#1C3D66"
 
@@ -622,7 +633,7 @@ def net_radius(n_nodes, spacing_mult=3.0):
     """The radius net_radius() nodes need at spacing_mult*NODE_RADIUS
     apart, padded by NET_RADIUS_PACKING_K for the rejection sampler's own
     (well short of 100%) packing efficiency -- confirmed reliable
-    (placing every node comfortably inside sample_cloud's 4000-try
+    (placing every node comfortably inside sample_cloud's MAX_SAMPLE_TRIES
     budget) at spacing_mult=3.0. Callers needing to stay on screen should
     min() this against MAX_NET_RADIUS rather than use it directly (see
     STAGES below) -- past that radius, growing outward stops helping and
@@ -686,26 +697,70 @@ INTRO_END_STAGE = dict(n_nodes=10, cloud_radius=1.17, k_neighbors=2, node_radius
 # one is *meant* to overflow the screen on three sides (top, right, and
 # bottom; left stays put, since that's the edge the arrow still needs to
 # reach), to land the point that whatever this has become no longer fits
-# in the frame meant to contain it. spacing_mult packed noticeably tighter
-# than any STAGES entry (down from the default 3.0) -- at 432 nodes and
-# the default spacing, the sheer *radius* needed reads as sparse (lots of
-# empty space between nodes) rather than dense; this keeps the same 432
-# nodes but in much less area, confirmed to still place all of them
-# (well inside sample_cloud's 4000-try budget) and still comfortably
-# bigger than both MAX_NET_RADIUS and MAX_NET_RADIUS_Y, so it's still
-# unmistakably overflowing, just a denser overflow. k_neighbors is kept
-# modest despite the huge node count purely for render time -- this many
-# nodes already renders slowly; a denser mesh on top of that compounds
-# fast.
-FINAL_STAGE_SPACING_MULT = 1.8
+# in the frame meant to contain it.
+#
+# Shaped as a leftward-opening "sideways parabola" (see sample_cloud's
+# shape="parabola") rather than a circle/ellipse like every STAGES net --
+# reaching its full horizontal depth exactly at the arrow's own height
+# (y=0) and sweeping back in above and below that as |y| grows, so the
+# curve's two arms read as closing around/enveloping the arrow's own tip
+# rather than opening away from it. FINAL_STAGE_X_MAX/
+# _Y_MAX are hand-picked (not derived from net_radius(), which assumes a
+# circle) so this net's density -- nodes per unit area -- matches
+# STAGES[-1]'s own actual (capped-and-stretched) density, ~13.55/unit^2,
+# rather than the far sparser density net_radius()'s circular formula
+# would give at this node count: this reads as the natural continuation
+# of what grew it, not as suddenly thinning out right as the chain
+# reaches its final, most "overflowing" net.
+#
+# spacing_mult is tighter than the default 3.0, but not as tight as it
+# looks: sample_cloud's min_dist floor (spacing_mult*NODE_RADIUS) is
+# compared against raw NODE_RADIUS, but make_node's own mid ring -- the
+# actual solid, opaque circle that reads as "the node" -- is drawn at
+# NODE_RADIUS*1.15, not NODE_RADIUS. Two nodes only visually clear each
+# other once spacing_mult exceeds 2*1.15 = 2.3, and this stays a bit past
+# that (rather than right at it, which would leave circles exactly
+# kissing with zero clear margin) for a small but real gap between
+# them. Below 2.3 -- 1.8, this value until it visibly produced
+# overlapping circles, was one such case -- min_dist is smaller than the
+# nodes actually drawn, so they overlap regardless of how correctly the
+# rejection sampler enforces that same (too-small) min_dist. Confirmed by
+# direct simulation to still place all 432 nodes at this spacing, inside
+# this same smaller, denser area, well inside sample_cloud's
+# MAX_SAMPLE_TRIES budget (needs ~11900 tries, not the old 4000 -- see
+# MAX_SAMPLE_TRIES's own comment). k_neighbors is kept modest despite the
+# huge node count purely for render time -- this many nodes already
+# renders slowly; a denser mesh on top of that compounds fast.
+FINAL_STAGE_SPACING_MULT = 2.5
+# Used only for the icosahedron finale's own footprint offset below
+# (INCLUDE_FINALE=1) -- that mesh is a fixed hand-built shape, not a
+# build_net() cloud, so it still wants a plain symmetric "radius" to
+# center itself against the arrow, unlike the parabola net below.
 FINAL_STAGE_RADIUS = net_radius(432, FINAL_STAGE_SPACING_MULT)
+FINAL_STAGE_X_MAX = 5.2
+FINAL_STAGE_Y_MAX = 4.6
+# How far back (as a fraction of FINAL_STAGE_X_MAX) the parabola's arms
+# reach behind the touch point at their deepest, y=+-FINAL_STAGE_Y_MAX
+# (see sample_cloud's shape="parabola"). 0.6 world units there -- comparable
+# to ARROW_LENGTH (0.7) itself, clearly short of reaching back to the
+# brace/code -- but the parabola's own shape (a y^2 falloff, near-zero right
+# at y=0) already keeps the reach far smaller than that near the arrow's
+# actual own height, where GAP (0.25) is the real constraint: at
+# FINAL_STAGE's own right_arrow tip half-height (ARROW_TIP_HALF_HEIGHT,
+# 0.175 -- the widest the arrow itself ever gets), this reaches back only
+# 0.6*(0.175/4.6)^2 ~ 0.00086 world units, nowhere close to GAP, so the
+# curve's arms clear the arrow's own polygon everywhere the arrow actually
+# occupies space, not just at y=0 exactly.
+PARABOLA_WRAP_FRAC = 0.6 / FINAL_STAGE_X_MAX
 FINAL_STAGE = dict(
     n_nodes=432,
-    cloud_radius=FINAL_STAGE_RADIUS,
+    cloud_radius=FINAL_STAGE_X_MAX,
     k_neighbors=4,
     node_radius=NODE_RADIUS,
     seed=9,
     spacing_mult=FINAL_STAGE_SPACING_MULT,
+    radius_y=FINAL_STAGE_Y_MAX,
+    shape="parabola",
 )
 
 # One multiplier per STAGES[1:] transition, plus FINAL_CODE_MULT for the
@@ -1141,7 +1196,17 @@ def make_glow_blob(local_points, edge_indices, cloud_radius, node_radius):
     return image
 
 
-def sample_cloud(n, radius, node_radius, seed, min_dist_factor=0.32, spacing_mult=3.0, radius_y=None):
+# Every STAGES/INTRO_END_STAGE net places all its nodes well inside the
+# old 4000-try cap; only FINAL_STAGE's own tighter FINAL_STAGE_SPACING_MULT
+# (see its own comment) needs more headroom than that -- confirmed by
+# direct simulation to need ~11900 tries, not 4000, to place all 432 nodes
+# at that spacing. Raised generously past that instead of tuned to the
+# exact number so it isn't one future seed/parameter tweak away from
+# silently placing fewer nodes than asked for again.
+MAX_SAMPLE_TRIES = 20000
+
+
+def sample_cloud(n, radius, node_radius, seed, min_dist_factor=0.32, spacing_mult=3.0, radius_y=None, shape="ellipse"):
     """n points scattered inside a disc of the given radius (or an ellipse,
     if radius_y differs from radius -- see STAGES' vertical stretch for
     later stages), rejecting anything too close to a point already placed
@@ -1157,17 +1222,42 @@ def sample_cloud(n, radius, node_radius, seed, min_dist_factor=0.32, spacing_mul
     them, so nodes at this size can never actually overlap, even for the
     sparsest/smallest-radius stages where the proportional spacing alone
     would allow it. Callers packing a fixed on-screen radius tighter to
-    fit more nodes (see STAGES) pass a smaller spacing_mult instead."""
+    fit more nodes (see STAGES) pass a smaller spacing_mult instead.
+
+    shape="parabola" (only FINAL_STAGE uses this) instead bounds the
+    region on its right/far side with a plain flat cutoff at x=radius --
+    that edge is meant to sit off-screen, so it doesn't need any curve at
+    all -- and on its left/near side (the one touching whatever this net
+    grew out of) with a leftward-opening parabola, x = -PARABOLA_WRAP_
+    FRAC*radius*(y/radius_y)^2. That boundary sits exactly at x=0 (the
+    touch point) at y=0, and swings to negative x -- behind the touch
+    point -- as |y| grows toward +-radius_y, so the two arms sweep
+    around/envelop whatever sits at the touch point (rather than opening
+    away from it) without crossing x=0 at y=0 itself, where that thing
+    (see PARABOLA_WRAP_FRAC's own comment for why this stays clear of
+    FINAL_STAGE's own arrow) actually is. Sampled with y as the free
+    variable (not x, unlike every other shape here) since x's own valid
+    range now depends on y, not the reverse, and that range can dip
+    negative, unlike every other shape's [0, 1]/[-1, 1] ranges -- see
+    PARABOLA_WRAP_FRAC for the clamp that keeps it from reaching back far
+    enough to actually overlap that touch point. center + these points
+    (see build_net) therefore places x=0, y=0 -- the near touch point,
+    not a centroid -- exactly at `center`."""
     radius_y = radius if radius_y is None else radius_y
     min_dist = max(min(radius, radius_y) * min_dist_factor, spacing_mult * node_radius)
     rng = random.Random(seed)
     points = []
     tries = 0
-    while len(points) < n and tries < 4000:
+    while len(points) < n and tries < MAX_SAMPLE_TRIES:
         tries += 1
-        x, y = rng.uniform(-1, 1), rng.uniform(-1, 1)
-        if x * x + y * y > 1:
-            continue
+        if shape == "parabola":
+            y = rng.uniform(-1, 1)
+            x_left = -PARABOLA_WRAP_FRAC * y * y
+            x = rng.uniform(x_left, 1)
+        else:
+            x, y = rng.uniform(-1, 1), rng.uniform(-1, 1)
+            if x * x + y * y > 1:
+                continue
         candidate = np.array([x * radius, y * radius_y, 0])
         if all(np.linalg.norm(candidate - p) > min_dist for p in points):
             points.append(candidate)
@@ -1402,7 +1492,17 @@ def _ensure_two_vertex_connected(points, edges, node_radius, block_margin=1.2, t
 
 
 def build_net(
-    n_nodes, cloud_radius, k_neighbors, node_radius, seed, center, palette, edge_color, spacing_mult=3.0, radius_y=None
+    n_nodes,
+    cloud_radius,
+    k_neighbors,
+    node_radius,
+    seed,
+    center,
+    palette,
+    edge_color,
+    spacing_mult=3.0,
+    radius_y=None,
+    shape="ellipse",
 ):
     # min_dist_factor forced to 0 (below sample_cloud's own default) --
     # its radius*min_dist_factor term scales *with* radius, so at the
@@ -1416,7 +1516,14 @@ def build_net(
     # pinned to the fixed spacing_mult*node_radius floor net_radius() was
     # actually solved against.
     local_points = sample_cloud(
-        n_nodes, cloud_radius, node_radius, seed, min_dist_factor=0.0, spacing_mult=spacing_mult, radius_y=radius_y
+        n_nodes,
+        cloud_radius,
+        node_radius,
+        seed,
+        min_dist_factor=0.0,
+        spacing_mult=spacing_mult,
+        radius_y=radius_y,
+        shape=shape,
     )
     points = [center + p for p in local_points]
 
@@ -1533,6 +1640,28 @@ def flow_arrows(left_net_edge, right_net_edge, brace, code):
 
 
 class RecursiveSelfImprovement(ThreeDScene):
+    def play(self, *args, **kwargs):
+        # INSTANT forces every self.play() call, everywhere in this
+        # scene, into a single rendered frame -- overriding whatever
+        # run_time each call already asked for, since Scene.compile_
+        # animations applies any run_time passed here to every top-level
+        # animation via plain setattr, not by rescaling anything. Each
+        # animation's own interpolate() still walks its rate_func from
+        # alpha=0 to alpha=1 exactly as it always did -- alpha=1 still
+        # means "fully settled" -- it now just does that walk across one
+        # frame's worth of clock time instead of its scripted duration,
+        # so every beat lands in its real final state, just instantly.
+        #
+        # Except a bare Wait: self.wait() (which hold() is built on)
+        # itself goes through self.play(Wait(run_time=duration, ...)) --
+        # indistinguishable, at this level, from any other self.play()
+        # call -- so without this exclusion INSTANT would silently zero
+        # out every hold() too, leaving nothing to actually look at.
+        is_bare_wait = len(args) == 1 and isinstance(args[0], Wait)
+        if INSTANT and not is_bare_wait:
+            kwargs["run_time"] = 1 / config.frame_rate
+        super().play(*args, **kwargs)
+
     def hold(self, duration):
         """A pause where nothing is being grown, written, or shifted --
         just a beat to let the current frame sit. Clamped to a short
@@ -1813,6 +1942,13 @@ class RecursiveSelfImprovement(ThreeDScene):
         brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
         ico_footprint_radius = FINAL_STAGE_RADIUS
         ico_center_x = right_net_center(ico_footprint_radius, code.get_right()[0])
+        # The flat stand-in net's own touch point (INCLUDE_FINALE=0
+        # below) -- unlike ico_center_x above, this isn't a circle's
+        # center; FINAL_STAGE's parabola is pinched to a point at local
+        # x=0, so putting that point (not a centroid) at this net's own
+        # facing edge is what actually makes it touch the arrow, same as
+        # every other net's left edge does.
+        final_vertex_x = right_facing_edge(code.get_right()[0])
         left_arrow, right_arrow = flow_arrows(
             left_facing_edge(brace.get_left()[0]), right_facing_edge(code.get_right()[0]), brace, code
         )
@@ -1886,11 +2022,11 @@ class RecursiveSelfImprovement(ThreeDScene):
             # Finale skipped (INCLUDE_FINALE=0, the default): the right
             # arrow still needs something to point at, so a final flat net
             # grows in the same right-hand spot every earlier net did --
-            # red, like the icosahedron it stands in for -- at the same
-            # footprint radius already used to space the arrow above, so
-            # the arrow's tip meets its edge.
+            # red, like the icosahedron it stands in for -- pinned by its
+            # own pinch point (see final_vertex_x above) so it touches
+            # the arrow the same way every other net's left edge does.
             final_net, final_nodes, final_edges, final_glow, final_extras = build_net(
-                center=np.array([ico_center_x, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **FINAL_STAGE
+                center=np.array([final_vertex_x, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **FINAL_STAGE
             )
             self.grow_in(
                 final_nodes, final_edges, final_glow, final_extras, FINAL_STAGE["node_radius"], RED_PALETTE,
