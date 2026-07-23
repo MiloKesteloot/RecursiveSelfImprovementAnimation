@@ -70,6 +70,7 @@ from manim import (
     LaggedStart,
     Line,
     Line3D,
+    Mobject,
     Polygon,
     Succession,
     Text,
@@ -85,10 +86,13 @@ from manim import (
 # that plays out), not resolution, since this assignment runs at import
 # time and overrides whatever resolution the flag set. Set LOW_RES=1 to
 # drop actual pixel count too, for fast layout-only iteration where frame
-# fidelity doesn't matter.
+# fidelity doesn't matter, or MID_RES=1 for a halfway point between the two.
 if os.environ.get("LOW_RES", "0") == "1":
     config.pixel_width = 480
     config.pixel_height = 270
+elif os.environ.get("MID_RES", "0") == "1":
+    config.pixel_width = 960
+    config.pixel_height = 540
 else:
     config.pixel_width = 1920
     config.pixel_height = 1080
@@ -129,11 +133,20 @@ INTRO_ONLY = os.environ.get("INTRO_ONLY", "0") == "1"
 MAIN_ONLY = os.environ.get("MAIN_ONLY", "0") == "1"
 
 # Set SIMPLE_STYLE=1 to strip every node down to one flat circle and every
-# edge down to one flat line -- no glow discs, no glow blob, no pulse-chain
-# animation. Purely a profiling stand-in to isolate how much of the render
-# cost Bloom Pulse's per-node glow discs and pulse chains (see module
-# docstring) actually account for, not a style meant to ship.
+# edge down to one flat line -- no glow discs, no glow blob, and pings
+# read as a plain node flash with no expanding ring (see fire()'s own
+# SIMPLE_STYLE check). Purely a profiling/preview stand-in to isolate how
+# much of the render cost Bloom Pulse's per-node glow discs and pulse
+# rings (see module docstring) actually account for, not a style meant
+# to ship.
 SIMPLE_STYLE = os.environ.get("SIMPLE_STYLE", "0") == "1"
+
+# Set FLASH_COLOR to a hex color to override every ping's flash color
+# (normally each net's own near-white palette core color) -- a one-off
+# override for previews where that near-white flash is hard to see
+# against the background, without touching the actual palette colors
+# used everywhere else (node fill, edges, arrows).
+FLASH_COLOR_OVERRIDE = os.environ.get("FLASH_COLOR") or None
 
 # Set EDGES_ONLY=1 to make node circles fully transparent -- geometry,
 # layout, and edge attachment are all unaffected (edges read node
@@ -152,6 +165,31 @@ EDGES_ONLY = os.environ.get("EDGES_ONLY", "0") == "1"
 # scripted duration. hold() is untouched, so there's still a beat to
 # actually look at each resulting layout.
 INSTANT = os.environ.get("INSTANT", "0") == "1"
+
+# Set DEMO_SECONDS to a positive number to stop the render once that many
+# seconds of the scene's own timeline (not wall-clock render time) have
+# played -- e.g. DEMO_SECONDS=20 renders just the opening 20s, skipping
+# every self.play/hold beyond that instead of rendering the full scene
+# and trimming after. Only checked between top-level self.play() calls,
+# so the actual cutoff lands at the end of whichever beat crosses the
+# threshold, not at the exact second.
+DEMO_SECONDS = float(os.environ.get("DEMO_SECONDS", "0") or 0)
+
+
+class _DemoLimitReached(Exception):
+    """Raised by RecursiveSelfImprovement.play once DEMO_SECONDS worth of
+    scene time has played, and caught in construct() so manim still
+    combines whatever's been rendered so far into a normal output file
+    instead of aborting the render outright."""
+
+
+# Temporary diagnostic: set DEBUG_PULSE=1 to have every pulse-chain
+# scheduler tick print its own accumulated dt-clock and the per-frame dt
+# it actually received, to check whether dt is somehow inflated while
+# the net is simultaneously the target of another running animation
+# (grow-in, slide).
+DEBUG_PULSE = os.environ.get("DEBUG_PULSE", "0") == "1"
+
 
 BACKGROUND_COLOR = "#0A1830"
 BACKDROP_GLOW_COLOR = "#1C3D66"
@@ -683,7 +721,7 @@ def _stage(n_nodes, spacing_mult, k_neighbors, seed, radius_y=None):
 
 
 STAGES = [
-    _stage(n_nodes=4, spacing_mult=3.00, k_neighbors=3, seed=21),
+    _stage(n_nodes=4, spacing_mult=3.00, k_neighbors=3, seed=25),
     _stage(n_nodes=8, spacing_mult=2.85, k_neighbors=4, seed=2),
     _stage(n_nodes=16, spacing_mult=2.70, k_neighbors=5, seed=3),
     _stage(n_nodes=32, spacing_mult=2.55, k_neighbors=6, seed=4),
@@ -990,12 +1028,32 @@ def add_node_flash(node, rest_color, flash_color, attack=0.05, release=0.6):
     `attack`, then ease it back down to rest_color over `release` -- a
     quick rise-then-fade, rather than snapping straight to flash_color
     on the first frame and only fading from there (which reads as a
-    flat white pop, not a flash)."""
+    flat white pop, not a flash).
+
+    Returns (trigger, tick) rather than attaching its own per-node
+    add_updater -- tick(dt) is meant to be called once per frame by the
+    net's single shared pulse-driver updater (see add_pulse_chains)
+    instead. A node-level updater would get a second, redundant call
+    every frame this node is itself mid-GrowFromCenter or mid-slide:
+    Animation.update_mobjects(dt) always ticks its own starting_mobject
+    (a Mobject.copy(), i.e. copy.deepcopy(node)) in addition to the
+    Scene's own per-frame update pass, and since plain functions are
+    atomic under deepcopy (copy.deepcopy returns the same function
+    object, not an independent one), that starting_mobject's "copy" of
+    this updater is actually the exact same closure over the exact same
+    mutable state -- so it fires for real, a second time, on the real
+    node, roughly doubling this node's own flash rate for as long as
+    it's being grown or slid. Confirmed directly: an instrumented run
+    logged 3-4x as many scheduler ticks per real rendered frame during
+    grow-in/slide than during a plain hold, exactly the "pings sped up
+    while spawning/moving" symptom. A tick() called explicitly by one
+    driver mobject that is never itself an Animation target has no
+    starting_mobject to get ghost-ticked through in the first place."""
     mid = node[0]
     duration = attack + release
     state = {"active": False, "t": 0.0}
 
-    def updater(mob, dt):
+    def tick(dt):
         if not state["active"]:
             return
         state["t"] += dt
@@ -1013,18 +1071,28 @@ def add_node_flash(node, rest_color, flash_color, attack=0.05, release=0.6):
         state["active"] = True
         state["t"] = 0.0
 
-    node.add_updater(updater)
-    return trigger
+    return trigger, tick
 
 
-def add_pulse_chains(nodes_group, edges_group, base_radius, palette, extras, chain_stagger=0.2):
+def add_pulse_chains(scene, nodes_group, edges_group, base_radius, palette, extras, chain_stagger=0.2):
     """One node pings, then an adjacent node (following an actual edge)
     0.2s later, then another -- 3-5 hops long -- rather than every node
     independently, randomly pinging on its own. A beat after a chain's
     last hop fires, another chain starts from a random node -- longer
     for small nets (fewer than SMALL_NET_THRESHOLD nodes), which have so
-    little to hop across that the default gap reads as spammy."""
+    little to hop across that the default gap reads as spammy.
+
+    The scheduler (and every node's own flash tick, see add_node_flash)
+    lives on one dedicated, invisible "driver" mobject added straight to
+    the scene -- not on `extras` and not on the nodes themselves -- and
+    is never the target of any grow/slide/fade Animation. A mobject that
+    IS such a target gets ghost-ticked an extra time per frame for as
+    long as that animation runs (see add_node_flash's own docstring for
+    why), which used to double or triple the effective ping rate right
+    when a net was growing in or sliding. A driver nobody ever animates
+    has no such ghost copy, so it only ever ticks once per real frame."""
     core_color, mid_color = palette[0], palette[1]
+    flash_color = FLASH_COLOR_OVERRIDE or core_color
     node_list = list(nodes_group)
     SMALL_NET_THRESHOLD = 6
     next_chain_cooldown = 0.9 if len(node_list) < SMALL_NET_THRESHOLD else 0.5
@@ -1035,7 +1103,9 @@ def add_pulse_chains(nodes_group, edges_group, base_radius, palette, extras, cha
         adjacency[i].append(j)
         adjacency[j].append(i)
 
-    flash_triggers = [add_node_flash(node, mid_color, core_color) for node in node_list]
+    flash_pairs = [add_node_flash(node, mid_color, flash_color) for node in node_list]
+    flash_triggers = [pair[0] for pair in flash_pairs]
+    flash_ticks = [pair[1] for pair in flash_pairs]
 
     # The flash fires slightly after the ring spawns -- simultaneous
     # felt backwards, since the ring starts at the node's own radius and
@@ -1059,8 +1129,25 @@ def add_pulse_chains(nodes_group, edges_group, base_radius, palette, extras, cha
     # growing in (or right after it slides into place), so the first
     # chain should fire the instant that happens, not after a pause.
     state = {"cooldown": 0.0, "queue": [], "flash_queue": []}
+    debug_tag = id(nodes_group) % 1000
+    debug_clock = {"t": 0.0, "n": 0}
 
     def scheduler(mob, dt):
+        if DEBUG_PULSE:
+            debug_clock["t"] += dt
+            debug_clock["n"] += 1
+            print(
+                f"PULSE tag={debug_tag} tick={debug_clock['n']} clock={debug_clock['t']:.4f} dt={dt:.5f}",
+                flush=True,
+            )
+        # Every node's own flash tick lives here now too (see
+        # add_node_flash) rather than as that node's own add_updater --
+        # driven unconditionally every call, same as before, just no
+        # longer contingent on the node itself carrying an updater that
+        # a GrowFromCenter/slide could ghost-tick a second time.
+        for node_tick in flash_ticks:
+            node_tick(dt)
+
         pending_flash = []
         for delay, idx in state["flash_queue"]:
             delay -= dt
@@ -1074,6 +1161,8 @@ def add_pulse_chains(nodes_group, edges_group, base_radius, palette, extras, cha
         for delay, idx in state["queue"]:
             delay -= dt
             if delay <= 0:
+                if DEBUG_PULSE:
+                    print(f"PULSE tag={debug_tag} FIRE clock={debug_clock['t']:.4f} idx={idx}", flush=True)
                 fire(idx)
             else:
                 pending.append([delay, idx])
@@ -1103,7 +1192,19 @@ def add_pulse_chains(nodes_group, edges_group, base_radius, palette, extras, cha
         state["queue"] = [[i * chain_stagger, idx] for i, idx in enumerate(path)]
         state["cooldown"] = next_chain_cooldown
 
-    extras.add_updater(scheduler)
+    # A plain empty Mobject, added to the scene on its own -- never
+    # nested under extras/nodes_group/next_net and never itself the
+    # target of any FadeIn/GrowFromCenter/animate call, so nothing ever
+    # creates a starting_mobject copy of it to ghost-tick. Stashed on
+    # extras (a harmless plain attribute, not a submobject -- Animation's
+    # own recursive update() only ever follows .submobjects, never
+    # arbitrary attributes) purely so stop_effects/resume_effects can
+    # find and clear it later without changing either function's own
+    # signature.
+    driver = Mobject()
+    scene.add(driver)
+    driver.add_updater(scheduler)
+    extras.pulse_driver = driver
 
 
 def stop_effects(extras, remove_rings=True):
@@ -1129,21 +1230,29 @@ def stop_effects(extras, remove_rings=True):
     the ring freezing in place is fine, since the very next thing that
     happens is a FadeOut sweeping whatever's left in extras, ring
     included, to opacity 0 right along with everything else, rather than
-    the ring vanishing on its own a beat before the net around it does."""
+    the ring vanishing on its own a beat before the net around it does.
+
+    The pulse scheduler itself no longer lives on `extras` directly (see
+    add_pulse_chains's own driver mobject) -- extras.pulse_driver is
+    cleared instead, alongside extras' own updaters (there mainly for
+    resume_effects' own bloom-disc tracking, in whichever style still
+    uses that)."""
     extras.clear_updaters()
+    if hasattr(extras, "pulse_driver"):
+        extras.pulse_driver.clear_updaters()
     for mob in list(extras):
         mob.clear_updaters()
         if remove_rings and isinstance(mob, Circle):
             extras.remove(mob)
 
 
-def resume_effects(extras, nodes_group, edges_group, node_radius, palette):
+def resume_effects(scene, extras, nodes_group, edges_group, node_radius, palette):
     """Re-attach bloom-disc tracking and restart the pulse chains --
     call right after any animation that moves a net (e.g. the slide
     into the left slot)."""
     for disc in extras:
         disc.add_updater(lambda mob: mob.move_to(mob.tracked_node.get_center()))
-    add_pulse_chains(nodes_group, edges_group, node_radius, palette, extras)
+    add_pulse_chains(scene, nodes_group, edges_group, node_radius, palette, extras)
 
 
 def make_node(pos, radius, palette):
@@ -1775,7 +1884,29 @@ class RecursiveSelfImprovement(ThreeDScene):
         is_bare_wait = len(args) == 1 and isinstance(args[0], Wait)
         if INSTANT and not is_bare_wait:
             kwargs["run_time"] = 1 / config.frame_rate
+        if DEBUG_PULSE:
+            kinds = ", ".join(type(a).__name__ for a in args)
+            print(
+                f"ANIM begin kinds=[{kinds}] run_time_kwarg={kwargs.get('run_time')} "
+                f"is_bare_wait={is_bare_wait}",
+                flush=True,
+            )
         super().play(*args, **kwargs)
+        if DEBUG_PULSE:
+            print("ANIM end", flush=True)
+        if DEMO_SECONDS > 0:
+            # Every non-wait call in this script passes run_time= explicitly,
+            # which Scene.compile_animations applies to every top-level
+            # animation uniformly -- so kwargs["run_time"] is exactly this
+            # call's own duration. A bare Wait (hold()) never gets a
+            # run_time kwarg from Scene.wait, so its duration is read off
+            # the Wait animation itself instead.
+            duration = kwargs.get("run_time")
+            if duration is None and is_bare_wait:
+                duration = args[0].run_time
+            self._demo_elapsed += duration or 0
+            if self._demo_elapsed >= DEMO_SECONDS:
+                raise _DemoLimitReached()
 
     def hold(self, duration):
         """A pause where nothing is being grown, written, or shifted --
@@ -1815,6 +1946,32 @@ class RecursiveSelfImprovement(ThreeDScene):
             wait_time = delay_frac * run_time * 0.7
             edge_fade_ins.append(Succession(Wait(wait_time), FadeIn(edge, run_time=run_time - wait_time)))
 
+        # Started before the grow-in's own self.play (rather than after
+        # it finishes) so the first pings can fire while nodes are still
+        # scaling up from GrowFromCenter, not only once the net is fully
+        # formed. Runs under SIMPLE_STYLE too -- see fire()'s own
+        # SIMPLE_STYLE check, which keeps the flash but drops the
+        # expanding ring.
+        #
+        # No suspend_mobject_updating=False needed on FadeIn(extras) or the
+        # per-node GrowFromCenter below (an earlier version of this used
+        # that, to stop Animation.begin()'s default suspend_updating() from
+        # freezing the scheduler/flash for the whole grow-in) -- it caused
+        # a worse problem than the one it fixed: Animation.update_mobjects
+        # always ticks its own starting_mobject (a Mobject.copy(), i.e.
+        # copy.deepcopy(extras) or copy.deepcopy(node)) once per frame in
+        # addition to the Scene's own per-frame update pass, and since
+        # plain functions are atomic under deepcopy (the same function
+        # object comes back, not an independent one), that "copy" carries
+        # the exact same scheduler/flash closures, over the exact same
+        # mutable state, as the real one -- so it fires for real, a second
+        # time, on the real net, for as long as that particular animation
+        # runs. Confirmed directly: an instrumented run logged 3-4x as many
+        # scheduler ticks per rendered frame during grow-in/slide as during
+        # a plain hold. add_pulse_chains' own driver mobject sidesteps this
+        # instead of fighting it -- see its docstring -- so nothing here
+        # needs to touch suspend_mobject_updating at all any more.
+        add_pulse_chains(self, nodes_group, edges_group, node_radius, palette, extras)
         self.play(
             FadeIn(glow),
             FadeIn(extras),
@@ -1822,13 +1979,9 @@ class RecursiveSelfImprovement(ThreeDScene):
             LaggedStart(*[GrowFromCenter(n) for n in node_list], lag_ratio=0.04),
             run_time=run_time,
         )
-        # Not started any earlier than this -- a ping firing on a net
-        # that's still forming would read as broken, not alive. Runs
-        # under SIMPLE_STYLE too -- see fire()'s own SIMPLE_STYLE check,
-        # which keeps the flash but drops the expanding ring.
-        add_pulse_chains(nodes_group, edges_group, node_radius, palette, extras)
 
     def construct(self):
+        self._demo_elapsed = 0.0
         self.camera.background_color = BACKGROUND_COLOR
         self.set_camera_orientation(phi=0 * DEGREES, theta=-90 * DEGREES)
 
@@ -1845,12 +1998,15 @@ class RecursiveSelfImprovement(ThreeDScene):
         # pattern (net -> code -> bigger net) used throughout mini-movie
         # 2, then a beat of plain blank background as a hard cut between
         # the two, then mini-movie 2 -- the full chain -- runs unchanged.
-        if not MAIN_ONLY:
-            self.construct_intro()
-            if INTRO_ONLY:
-                return
-            self.hold(1.0)
-        self.construct_main(backdrop)
+        try:
+            if not MAIN_ONLY:
+                self.construct_intro()
+                if INTRO_ONLY:
+                    return
+                self.hold(1.0)
+            self.construct_main(backdrop)
+        except _DemoLimitReached:
+            pass
 
     def construct_intro(self):
         """Mini-movie 1: one simple lap -- a small blue net grows in,
@@ -2003,6 +2159,21 @@ class RecursiveSelfImprovement(ThreeDScene):
                 edge_color=NET_EDGE_COLORS[i],
                 **stage,
             )
+            # current_net's own pulse scheduler is stopped here -- right as
+            # next_net starts growing in -- rather than later, right before
+            # the slide: left running through next_net's own grow-in and
+            # the hold after it (as it used to be), current_net's still-live
+            # chain and next_net's freshly-started one (see grow_in's own
+            # add_pulse_chains call, now started before next_net's growth
+            # animation rather than after) would both be pinging at once,
+            # roughly doubling how often a flash appears on screen for that
+            # whole stretch -- reading as the ping rate itself sped up, even
+            # though each chain's own hop-to-hop timing is untouched. No
+            # resume_effects needed afterward -- current_net is being
+            # discarded, not reused, so remove_rings=False: any ring still
+            # mid-flight fades out with the rest of it in the FadeOut below
+            # instead of vanishing on its own a beat early.
+            stop_effects(current_extras, remove_rings=False)
             self.grow_in(
                 next_nodes, next_edges, next_glow, next_extras, stage["node_radius"], NET_PALETTES[i],
                 run_time=max(1.3 * m, 0.5),
@@ -2013,19 +2184,14 @@ class RecursiveSelfImprovement(ThreeDScene):
             # is about to slide, not fade, and lives on as current_net
             # for the lap after this one, so a ring left mid-flight here
             # would freeze in place and sit on screen for the rest of
-            # the video instead of ever finishing.
-            stop_effects(next_extras)
-            # current_net's own pulse scheduler is still live too -- left
-            # running, it keeps adding/removing pulse-ring mobjects into
-            # current_extras for however many frames this FadeOut takes,
-            # changing current_net's family size mid-animation and
-            # crashing manim's interpolation (confirmed: "zip() argument
-            # 2 is shorter than argument 1"). No resume_effects needed
-            # afterward -- current_net is being discarded, not reused, so
-            # remove_rings=False: any ring still mid-flight fades out
-            # with the rest of it in the FadeOut below instead of
-            # vanishing on its own a beat early.
-            stop_effects(current_extras, remove_rings=False)
+            # the video instead of ever finishing. Skipped entirely under
+            # SIMPLE_STYLE: fire() never spawns a ring in that style (see
+            # its own SIMPLE_STYLE check), so extras' family size never
+            # changes and there's nothing for a slide's animate.shift()
+            # to trip over -- letting the ping keep firing straight
+            # through the slide instead of visibly pausing for it.
+            if not SIMPLE_STYLE:
+                stop_effects(next_extras)
             # The lap right after this one is the final, deliberately-
             # overflowing net -- centering the composition around it
             # would try to drag everything sideways to "balance" a net
@@ -2038,6 +2204,10 @@ class RecursiveSelfImprovement(ThreeDScene):
             _, next_brace_left = code_edges_for(lap_code_lines[i])
             new_left_center = left_net_center(stage_radius, next_brace_left + next_shift)
             slide_shift = new_left_center - right_net_center(stage_radius, code.get_right()[0])
+            # Plain next_net.animate.shift() -- no suspend_mobject_updating
+            # override needed (see add_pulse_chains' own driver mobject and
+            # add_node_flash's docstring for why a plain .animate() no
+            # longer risks freezing or double-ticking anything).
             self.play(
                 FadeOut(current_net),
                 FadeOut(code),
@@ -2047,7 +2217,8 @@ class RecursiveSelfImprovement(ThreeDScene):
                 next_net.animate.shift(np.array([slide_shift, 0, 0])),
                 run_time=max(1.0 * m, 0.45),
             )
-            resume_effects(next_extras, next_nodes, next_edges, stage["node_radius"], NET_PALETTES[i])
+            if not SIMPLE_STYLE:
+                resume_effects(self, next_extras, next_nodes, next_edges, stage["node_radius"], NET_PALETTES[i])
             current_net, current_nodes, current_edges, current_glow, current_extras = (
                 next_net, next_nodes, next_edges, next_glow, next_extras,
             )
@@ -2160,6 +2331,13 @@ class RecursiveSelfImprovement(ThreeDScene):
             final_net, final_nodes, final_edges, final_glow, final_extras = build_net(
                 center=np.array([final_vertex_x, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **FINAL_STAGE
             )
+            # current_net's own pulse scheduler is stopped here -- right as
+            # final_net starts growing in -- same reasoning as the main
+            # loop's own stop_effects(current_extras) call: left running
+            # through final_net's grow-in and the hold after it, both nets'
+            # chains would be pinging at once, roughly doubling how often a
+            # flash appears on screen for that stretch.
+            stop_effects(current_extras, remove_rings=False)
             self.grow_in(
                 final_nodes, final_edges, final_glow, final_extras, FINAL_STAGE["node_radius"], RED_PALETTE,
                 run_time=max(1.3 * FINAL_CODE_MULT, 0.5),
@@ -2170,14 +2348,13 @@ class RecursiveSelfImprovement(ThreeDScene):
             # synchronized block, and the backdrop stays put throughout --
             # so this reads as the scene's pieces settling away, not the
             # whole picture (background glow included) dimming to black.
-            # Both nets' pulse schedulers are stopped first -- left
-            # running, either would keep mutating its extras mid-FadeOut
-            # and crash manim's interpolation (see the other stop_effects
-            # calls above for the confirmed error). remove_rings=False on
-            # both -- both nets are fading out for good here, so any ring
-            # still mid-flight fades with them instead of vanishing on
-            # its own a beat early.
-            stop_effects(current_extras, remove_rings=False)
+            # final_net's own pulse scheduler is stopped here too -- left
+            # running, it would keep mutating final_extras mid-FadeOut and
+            # crash manim's interpolation (see the other stop_effects calls
+            # above for the confirmed error). remove_rings=False -- both
+            # nets are fading out for good here, so any ring still
+            # mid-flight fades with them instead of vanishing on its own a
+            # beat early.
             stop_effects(final_extras, remove_rings=False)
             self.play(
                 LaggedStart(
