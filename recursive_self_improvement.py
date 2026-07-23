@@ -1232,6 +1232,22 @@ def add_pulse_chains(scene, nodes_group, edges_group, base_radius, palette, extr
     driver.add_updater(scheduler)
     extras.pulse_driver = driver
 
+    # ring_holder (see build_net) is a family member of next_net for
+    # movement/fade purposes, but next_net as a *whole* is never itself
+    # targeted by any animation until the slide/FadeOut much later --
+    # grow_in only ever targets its individual pieces (glow, extras,
+    # edges, nodes) directly, and manim only adds a mobject to the
+    # scene's own render/update list when it's self.add()-ed or is the
+    # direct target of a running Animation. Left implicit, ring_holder
+    # would never actually become part of the scene at all: any ring
+    # added to it would exist as a live Python object with a running
+    # updater, yet never be drawn and never receive a single per-frame
+    # update -- rings that fire but are never seen (confirmed against an
+    # actual render: zero rings visible anywhere, despite fire() calling
+    # spawn_pulse_ring exactly as expected). Added directly here instead
+    # of relying on some later animation to sweep it in.
+    scene.add(extras.ring_holder)
+
     # Stashed on extras (same reasoning as pulse_driver above) so
     # stop_effects/resume_effects can toggle rings_locked around a
     # whole-net animation without needing this closure's own state
