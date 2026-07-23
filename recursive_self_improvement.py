@@ -1116,9 +1116,20 @@ def add_pulse_chains(scene, nodes_group, edges_group, base_radius, palette, extr
 
     def fire(idx):
         # SIMPLE_STYLE keeps the flash (a node lighting up) but skips the
-        # expanding ring -- this render pass wants pings to read as "the
-        # node flashes," not the ring's own separate growth/fade.
-        if not SIMPLE_STYLE:
+        # expanding ring entirely -- this render pass wants pings to read
+        # as "the node flashes," not the ring's own separate growth/fade.
+        #
+        # rings_locked additionally withholds *real* rings (regardless of
+        # style) for as long as this net's own grow-in self.play is still
+        # in flight -- see unlock_rings below for why: spawn_pulse_ring
+        # calls extras.add(ring), and extras is FadeIn(extras)'s own
+        # direct target during grow-in, so a ring arriving mid-FadeIn
+        # changes extras' family size while manim's own interpolation is
+        # mid-stride over it, which crashes outright ("zip() argument 2 is
+        # shorter than argument 1", confirmed against an actual render).
+        # The flash still fires immediately either way -- only the ring
+        # waits.
+        if not SIMPLE_STYLE and not state["rings_locked"]:
             spawn_pulse_ring(node_list[idx], base_radius, core_color, extras)
         state["flash_queue"].append([FLASH_DELAY, idx])
 
@@ -1128,7 +1139,9 @@ def add_pulse_chains(scene, nodes_group, edges_group, base_radius, palette, extr
     # Initial cooldown is zero -- this is attached right as a net finishes
     # growing in (or right after it slides into place), so the first
     # chain should fire the instant that happens, not after a pause.
-    state = {"cooldown": 0.0, "queue": [], "flash_queue": []}
+    # rings_locked starts True -- see fire()'s own comment and
+    # unlock_rings below.
+    state = {"cooldown": 0.0, "queue": [], "flash_queue": [], "rings_locked": True}
     debug_tag = id(nodes_group) % 1000
     debug_clock = {"t": 0.0, "n": 0}
 
@@ -1206,6 +1219,11 @@ def add_pulse_chains(scene, nodes_group, edges_group, base_radius, palette, extr
     driver.add_updater(scheduler)
     extras.pulse_driver = driver
 
+    def unlock_rings():
+        state["rings_locked"] = False
+
+    return unlock_rings
+
 
 def stop_effects(extras, remove_rings=True):
     """Freeze this net's bloom-disc tracking and pulse scheduler --
@@ -1252,7 +1270,12 @@ def resume_effects(scene, extras, nodes_group, edges_group, node_radius, palette
     into the left slot)."""
     for disc in extras:
         disc.add_updater(lambda mob: mob.move_to(mob.tracked_node.get_center()))
-    add_pulse_chains(scene, nodes_group, edges_group, node_radius, palette, extras)
+    # Unlocked immediately, unlike grow_in's own call -- by the time this
+    # runs, the slide's own self.play has already returned, so there's no
+    # concurrently-running animation left for a freshly spawned ring to
+    # trip up (see add_pulse_chains' own rings_locked/unlock_rings).
+    unlock_rings = add_pulse_chains(scene, nodes_group, edges_group, node_radius, palette, extras)
+    unlock_rings()
 
 
 def make_node(pos, radius, palette):
@@ -1971,7 +1994,7 @@ class RecursiveSelfImprovement(ThreeDScene):
         # a plain hold. add_pulse_chains' own driver mobject sidesteps this
         # instead of fighting it -- see its docstring -- so nothing here
         # needs to touch suspend_mobject_updating at all any more.
-        add_pulse_chains(self, nodes_group, edges_group, node_radius, palette, extras)
+        unlock_rings = add_pulse_chains(self, nodes_group, edges_group, node_radius, palette, extras)
         self.play(
             FadeIn(glow),
             FadeIn(extras),
@@ -1979,6 +2002,14 @@ class RecursiveSelfImprovement(ThreeDScene):
             LaggedStart(*[GrowFromCenter(n) for n in node_list], lag_ratio=0.04),
             run_time=run_time,
         )
+        # Only now -- rings withheld until FadeIn(extras) above has fully
+        # finished (see fire()'s own rings_locked check and this
+        # function's comment just above) -- a ring arriving any earlier
+        # would change extras' family size while manim's own interpolation
+        # is still mid-stride over it and crash outright. The flash isn't
+        # gated this way; only the ring visual waits a beat longer than
+        # the ping that triggered it.
+        unlock_rings()
 
     def construct(self):
         self._demo_elapsed = 0.0
@@ -2159,21 +2190,6 @@ class RecursiveSelfImprovement(ThreeDScene):
                 edge_color=NET_EDGE_COLORS[i],
                 **stage,
             )
-            # current_net's own pulse scheduler is stopped here -- right as
-            # next_net starts growing in -- rather than later, right before
-            # the slide: left running through next_net's own grow-in and
-            # the hold after it (as it used to be), current_net's still-live
-            # chain and next_net's freshly-started one (see grow_in's own
-            # add_pulse_chains call, now started before next_net's growth
-            # animation rather than after) would both be pinging at once,
-            # roughly doubling how often a flash appears on screen for that
-            # whole stretch -- reading as the ping rate itself sped up, even
-            # though each chain's own hop-to-hop timing is untouched. No
-            # resume_effects needed afterward -- current_net is being
-            # discarded, not reused, so remove_rings=False: any ring still
-            # mid-flight fades out with the rest of it in the FadeOut below
-            # instead of vanishing on its own a beat early.
-            stop_effects(current_extras, remove_rings=False)
             self.grow_in(
                 next_nodes, next_edges, next_glow, next_extras, stage["node_radius"], NET_PALETTES[i],
                 run_time=max(1.3 * m, 0.5),
@@ -2192,6 +2208,26 @@ class RecursiveSelfImprovement(ThreeDScene):
             # through the slide instead of visibly pausing for it.
             if not SIMPLE_STYLE:
                 stop_effects(next_extras)
+            # current_net's own pulse scheduler is stopped here -- right
+            # before it fades out for good, same as every other
+            # stop_effects call site -- left running any earlier (an
+            # earlier version of this stopped it the moment next_net
+            # started growing in, on the theory that two simultaneously
+            # live chains were what made pings look sped up during
+            # grow-in/slide) made the *outgoing* net's pinging visibly
+            # cut out right as the incoming one appeared. That theory
+            # didn't hold up: the actual cause (confirmed by instrumented
+            # logging) was Animation.update_mobjects ghost-ticking a
+            # shared closure through each animation's own starting_mobject
+            # copy (see add_node_flash's docstring) -- fixed at the root
+            # by add_pulse_chains' own driver mobject, which needed no
+            # help from stopping either net early. Two nets pinging at
+            # once here is exactly the original, intended look. No
+            # resume_effects needed afterward -- current_net is being
+            # discarded, not reused, so remove_rings=False: any ring
+            # still mid-flight fades out with the rest of it in the
+            # FadeOut below instead of vanishing on its own a beat early.
+            stop_effects(current_extras, remove_rings=False)
             # The lap right after this one is the final, deliberately-
             # overflowing net -- centering the composition around it
             # would try to drag everything sideways to "balance" a net
@@ -2331,13 +2367,6 @@ class RecursiveSelfImprovement(ThreeDScene):
             final_net, final_nodes, final_edges, final_glow, final_extras = build_net(
                 center=np.array([final_vertex_x, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **FINAL_STAGE
             )
-            # current_net's own pulse scheduler is stopped here -- right as
-            # final_net starts growing in -- same reasoning as the main
-            # loop's own stop_effects(current_extras) call: left running
-            # through final_net's grow-in and the hold after it, both nets'
-            # chains would be pinging at once, roughly doubling how often a
-            # flash appears on screen for that stretch.
-            stop_effects(current_extras, remove_rings=False)
             self.grow_in(
                 final_nodes, final_edges, final_glow, final_extras, FINAL_STAGE["node_radius"], RED_PALETTE,
                 run_time=max(1.3 * FINAL_CODE_MULT, 0.5),
@@ -2348,13 +2377,15 @@ class RecursiveSelfImprovement(ThreeDScene):
             # synchronized block, and the backdrop stays put throughout --
             # so this reads as the scene's pieces settling away, not the
             # whole picture (background glow included) dimming to black.
-            # final_net's own pulse scheduler is stopped here too -- left
-            # running, it would keep mutating final_extras mid-FadeOut and
-            # crash manim's interpolation (see the other stop_effects calls
-            # above for the confirmed error). remove_rings=False -- both
-            # nets are fading out for good here, so any ring still
-            # mid-flight fades with them instead of vanishing on its own a
-            # beat early.
+            # Both nets' pulse schedulers are stopped here, right before
+            # they fade out for good (see the main loop's own
+            # stop_effects(current_extras) call for why this waits until
+            # just before the FadeOut rather than stopping current_net's
+            # the moment final_net started growing in). remove_rings=False
+            # on both -- both nets are fading out for good here, so any
+            # ring still mid-flight fades with them instead of vanishing
+            # on its own a beat early.
+            stop_effects(current_extras, remove_rings=False)
             stop_effects(final_extras, remove_rings=False)
             self.play(
                 LaggedStart(
