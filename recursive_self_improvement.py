@@ -994,11 +994,21 @@ def add_soft_bloom(node, radius, glow_color, extras):
         extras.add(disc)
 
 
-def spawn_pulse_ring(node, base_radius, color, ring_holder, max_growth_mult=1.6, duration=2.0, peak_opacity=0.425):
+def spawn_pulse_ring(node, color, ring_holder, max_growth_mult=1.6, duration=2.0, peak_opacity=0.425):
     """A single expanding, fading ring -- a brand-new mobject per ping
     rather than one ring reused per node, so a node pinged again while
     its last ring is still expanding gets a second, independent ring
     instead of the first one being cut short.
+
+    Sized live off the node's own current width every frame (see
+    current_radius below) rather than a fixed radius captured once at
+    spawn time -- a ping can fire while its node is still mid-
+    GrowFromCenter (see grow_in), and a ring sized for the node's
+    eventual full radius would read as oversized/mismatched next to a
+    node that's still small. Tracking the node's actual in-progress
+    scale, frame by frame, keeps the ring visually anchored to it the
+    whole time, including if the node is still growing when the ring's
+    own animation starts.
 
     Added to ring_holder, not extras itself -- see build_net's own
     comment on why rings get their own sibling container instead of
@@ -1010,10 +1020,16 @@ def spawn_pulse_ring(node, base_radius, color, ring_holder, max_growth_mult=1.6,
     slides with the net exactly as before, but is never itself a
     FadeIn/GrowFromCenter/animate target, so nothing is ever mid-stride
     over its family when a ring is added or removed."""
-    ring = Circle(radius=base_radius, stroke_color=color, stroke_width=2.4, fill_opacity=0)
+
+    def current_radius():
+        # node[0] is the node's own outer ring (see make_node) -- its
+        # live .width reflects however far GrowFromCenter has scaled it
+        # up so far, not just its eventual full size.
+        return node[0].width / 2
+
+    ring = Circle(radius=current_radius(), stroke_color=color, stroke_width=2.4, fill_opacity=0)
     ring.move_to(node.get_center())
     ring.set_z_index(2)  # matches extras -- see build_net's layering comment
-    max_growth = base_radius * max_growth_mult
     state = {"t": 0.0}
 
     def updater(mob, dt):
@@ -1023,8 +1039,11 @@ def spawn_pulse_ring(node, base_radius, color, ring_holder, max_growth_mult=1.6,
             ring_holder.remove(mob)
             mob.clear_updaters()
             return
+        base = current_radius()
         mob.become(
-            Circle(radius=base_radius + max_growth * progress, stroke_color=color, stroke_width=2.4, fill_opacity=0)
+            Circle(
+                radius=base * (1 + max_growth_mult * progress), stroke_color=color, stroke_width=2.4, fill_opacity=0
+            )
         )
         mob.move_to(node.get_center())
         mob.set_stroke(opacity=(1.0 - progress) * peak_opacity)
@@ -1085,7 +1104,7 @@ def add_node_flash(node, rest_color, flash_color, attack=0.05, release=0.6):
     return trigger, tick
 
 
-def add_pulse_chains(scene, nodes_group, edges_group, base_radius, palette, extras, chain_stagger=0.2):
+def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_stagger=0.2):
     """One node pings, then an adjacent node (following an actual edge)
     0.2s later, then another -- 3-5 hops long -- rather than every node
     independently, randomly pinging on its own. A beat after a chain's
@@ -1142,7 +1161,7 @@ def add_pulse_chains(scene, nodes_group, edges_group, base_radius, palette, extr
         # interpolating over, and crash outright ("zip() argument 2 is
         # shorter than argument 1", confirmed against an actual render).
         if not SIMPLE_STYLE and not state["rings_locked"]:
-            spawn_pulse_ring(node_list[idx], base_radius, core_color, extras.ring_holder)
+            spawn_pulse_ring(node_list[idx], core_color, extras.ring_holder)
         state["flash_queue"].append([FLASH_DELAY, idx])
 
     # queue holds [time_remaining, node_index] for hops still waiting to
@@ -2061,7 +2080,7 @@ class RecursiveSelfImprovement(ThreeDScene):
         # a plain hold. add_pulse_chains' own driver mobject sidesteps this
         # instead of fighting it -- see its docstring -- so nothing here
         # needs to touch suspend_mobject_updating at all any more.
-        add_pulse_chains(self, nodes_group, edges_group, node_radius, palette, extras)
+        add_pulse_chains(self, nodes_group, edges_group, palette, extras)
         self.play(
             FadeIn(glow),
             FadeIn(extras),
