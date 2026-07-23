@@ -994,7 +994,7 @@ def add_soft_bloom(node, radius, glow_color, extras):
         extras.add(disc)
 
 
-def spawn_pulse_ring(node, color, ring_holder, is_locked, max_growth_mult=1.6, duration=2.0, peak_opacity=0.425):
+def spawn_pulse_ring(node, color, max_growth_mult=1.6, duration=2.0, peak_opacity=0.425):
     """A single expanding, fading ring -- a brand-new mobject per ping
     rather than one ring reused per node, so a node pinged again while
     its last ring is still expanding gets a second, independent ring
@@ -1010,29 +1010,25 @@ def spawn_pulse_ring(node, color, ring_holder, is_locked, max_growth_mult=1.6, d
     whole time, including if the node is still growing when the ring's
     own animation starts.
 
-    Added to ring_holder, not extras itself -- see build_net's own
-    comment on why rings get their own sibling container instead of
-    living inside extras directly: a ring arriving (or self-removing)
-    while extras itself is the direct target of a running Animation
-    (grow_in's own FadeIn(extras)) changes extras' family size mid-
-    interpolation and crashes manim outright. ring_holder is a plain
-    sibling of extras under the same net Group, so it still fades and
-    slides with the net exactly as before, but is never itself a
-    FadeIn/GrowFromCenter/animate target, so nothing is ever mid-stride
-    over its family when a ring is added or removed.
-
-    is_locked (checked live every frame, not just at spawn time -- a
-    ring can easily still be mid-flight when a lock engages partway
-    through its own life) gates only the final ring_holder.remove() this
-    same crash risk requires -- removing a ring changes ring_holder's
-    own family size exactly like adding one does. Everything else
-    (become/move_to/set_stroke) keeps running regardless of the lock:
-    none of those touch ring_holder's family size, only this ring's own
-    shape, so there's nothing unsafe about a ring continuing to grow,
-    move, and fade while its own net is mid-slide or mid-FadeOut --
-    freezing it there (an earlier version of this cleared its updater
-    entirely whenever locked) was overkill for a risk that was only ever
-    about the remove() call specifically."""
+    Returns (ring, tick) rather than attaching its own add_updater --
+    tick(dt) is meant to be called once per frame by add_pulse_chains'
+    own driver mobject instead, exactly like add_node_flash's own tick.
+    A ring added straight to ring_holder (see build_net) *is* a family
+    member of whatever whole-net Animation is running during a slide or
+    FadeOut, so if the ring carried its own add_updater, that
+    Animation's own starting_mobject -- a copy.deepcopy(ring_holder)
+    taken at the animation's begin() -- would carry a "copy" of that
+    updater that's actually the exact same closure over the exact same
+    mutable state (plain functions are atomic under deepcopy, see
+    add_node_flash's own docstring for the confirmed mechanism), and
+    Animation.update_mobjects ticks that starting_mobject once every
+    frame in addition to the Scene's own per-frame pass -- so the ring's
+    own progress clock would advance twice as fast for as long as that
+    animation ran. Confirmed directly: exactly the "pings sped up while
+    the other net moves" symptom, now fixed by never handing a ring its
+    own updater to begin with -- tick() is only ever invoked once, by
+    the driver, regardless of what's simultaneously animating the net
+    the ring happens to be sitting inside."""
 
     def current_radius():
         # node[0] is the node's own outer ring (see make_node) -- its
@@ -1045,24 +1041,26 @@ def spawn_pulse_ring(node, color, ring_holder, is_locked, max_growth_mult=1.6, d
     ring.set_z_index(2)  # matches extras -- see build_net's layering comment
     state = {"t": 0.0}
 
-    def updater(mob, dt):
+    def tick(dt):
+        """Returns True once this ring has finished growing/fading --
+        the caller (add_pulse_chains' own scheduler) decides when it's
+        actually safe to remove it from ring_holder, since that's the
+        one operation here that touches ring_holder's own family size
+        (see build_net's own comment on why that matters)."""
         state["t"] += dt
         progress = min(state["t"] / duration, 1.0)
         base = current_radius()
-        mob.become(
+        ring.become(
             Circle(
                 radius=base * (1 + max_growth_mult * progress), stroke_color=color, stroke_width=2.4, fill_opacity=0
             )
         )
-        mob.move_to(node.get_center())
-        mob.set_stroke(opacity=(1.0 - progress) * peak_opacity)
-        mob.set_z_index(2)  # become() replaces the mobject wholesale, z_index included
-        if progress >= 1.0 and not is_locked():
-            ring_holder.remove(mob)
-            mob.clear_updaters()
+        ring.move_to(node.get_center())
+        ring.set_stroke(opacity=(1.0 - progress) * peak_opacity)
+        ring.set_z_index(2)  # become() replaces the mobject wholesale, z_index included
+        return progress >= 1.0
 
-    ring.add_updater(updater)
-    ring_holder.add(ring)
+    return ring, tick
 
 
 def add_node_flash(node, rest_color, flash_color, attack=0.05, release=0.6):
@@ -1162,18 +1160,23 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
         # as "the node flashes," not the ring's own separate growth/fade.
         #
         # rings_locked (see lock_rings/unlock_rings below) withholds just
-        # the ring -- the flash still fires immediately either way -- for
-        # as long as ring_holder is a family member of whatever's directly
-        # being targeted by a currently-running whole-net animation (the
-        # slide, or this net's own final FadeOut): ring_holder itself is
-        # never such a target (see build_net's own comment on why it's a
-        # plain sibling of extras), so spawning mid-grow-in is always
-        # safe, but a ring arriving mid-slide or mid-FadeOut *would*
-        # change the size of the very family that animation is actively
-        # interpolating over, and crash outright ("zip() argument 2 is
-        # shorter than argument 1", confirmed against an actual render).
+        # *new* rings -- the flash still fires immediately either way --
+        # for as long as ring_holder is a family member of whatever's
+        # directly being targeted by a currently-running whole-net
+        # animation (the slide, or this net's own final FadeOut):
+        # ring_holder itself is never such a target (see build_net's own
+        # comment on why it's a plain sibling of extras), so spawning
+        # mid-grow-in is always safe, but a ring *arriving* mid-slide or
+        # mid-FadeOut would change the size of the very family that
+        # animation is actively interpolating over, and crash outright
+        # ("zip() argument 2 is shorter than argument 1", confirmed
+        # against an actual render). Already-spawned rings keep animating
+        # regardless (see the scheduler's own active_rings loop below) --
+        # only spawning a *new* one is what's actually unsafe here.
         if not SIMPLE_STYLE and not state["rings_locked"]:
-            spawn_pulse_ring(node_list[idx], core_color, extras.ring_holder, lambda: state["rings_locked"])
+            ring, ring_tick = spawn_pulse_ring(node_list[idx], core_color)
+            extras.ring_holder.add(ring)
+            state["active_rings"].append([ring, ring_tick, False])
         state["flash_queue"].append([FLASH_DELAY, idx])
 
     # queue holds [time_remaining, node_index] for hops still waiting to
@@ -1185,7 +1188,12 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
     # rings_locked starts False -- grow-in doesn't need it (see fire()'s
     # own comment) -- stop_effects/resume_effects (see below) toggle it
     # around the one remaining unsafe window, a whole-net animation.
-    state = {"cooldown": 0.0, "queue": [], "flash_queue": [], "rings_locked": False}
+    # active_rings holds [ring, tick, finished] for every ring still
+    # being tracked -- finished flips to True once tick() reports the
+    # ring is done growing/fading, but it stays in this list (ticked no
+    # further) until it's actually safe to remove from ring_holder (see
+    # the scheduler's own active_rings loop below).
+    state = {"cooldown": 0.0, "queue": [], "flash_queue": [], "rings_locked": False, "active_rings": []}
     debug_tag = id(nodes_group) % 1000
     debug_clock = {"t": 0.0, "n": 0}
 
@@ -1204,6 +1212,28 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
         # a GrowFromCenter/slide could ghost-tick a second time.
         for node_tick in flash_ticks:
             node_tick(dt)
+
+        # Every in-flight ring's own tick (see spawn_pulse_ring) lives
+        # here too, for the identical reason -- ring_holder is a family
+        # member of whatever whole-net Animation might be running (the
+        # slide, a FadeOut), so a ring with its own add_updater would get
+        # ghost-ticked an extra time per frame for as long as that
+        # animation runs, roughly doubling its own growth/fade speed
+        # (confirmed directly: exactly the "pings sped up while the
+        # other net moves" symptom). Once a ring finishes (tick returns
+        # True), it's ticked no further -- only actually removed from
+        # ring_holder once rings_locked has lifted (removing changes
+        # ring_holder's own family size, the one operation here that
+        # still isn't safe mid-whole-net-animation).
+        still_active = []
+        for ring, ring_tick, finished in state["active_rings"]:
+            if not finished:
+                finished = ring_tick(dt)
+            if finished and not state["rings_locked"]:
+                extras.ring_holder.remove(ring)
+            else:
+                still_active.append([ring, ring_tick, finished])
+        state["active_rings"] = still_active
 
         pending_flash = []
         for delay, idx in state["flash_queue"]:
@@ -1298,11 +1328,12 @@ def stop_effects(extras):
     call before any animation that repositions OR fades out the net as a
     whole (the slide, or a final FadeOut). The scheduler, every node's
     own flash, and every ring already in flight all keep running right
-    through it regardless (they live on add_pulse_chains' own driver
-    mobject, or check this same lock live every frame -- see
-    spawn_pulse_ring) -- only *new* rings are withheld here, so a
-    stationary or fading net keeps pinging, rings included, instead of
-    visibly going quiet the moment something else starts moving.
+    through it regardless -- all three live on add_pulse_chains' own
+    driver mobject now (see spawn_pulse_ring and its own tick, ticked
+    once per frame from the scheduler's active_rings loop) -- only *new*
+    rings are withheld here, so a stationary or fading net keeps
+    pinging, rings included, instead of visibly going quiet the moment
+    something else starts moving.
 
     Bloom-disc tracking is cleared for an older, unrelated reason:
     .suspend_updating() turned out not to be enough on its own -- even
@@ -1320,11 +1351,12 @@ def stop_effects(extras):
     exactly that family crashes manim outright ("zip() argument 2 is
     shorter than argument 1", confirmed against an actual render). Only
     the add/remove itself is unsafe, not a ring's own ongoing growth/
-    fade/move -- spawn_pulse_ring's own updater keeps every already-
-    spawned ring animating normally, it just defers that one remove()
-    call until this same lock lifts again (see resume_effects), which
-    for a ring already most of the way through its 2s life by the time
-    a fade/slide starts is rarely more than a beat away anyway."""
+    fade/move -- the scheduler's own active_rings loop keeps ticking
+    every already-spawned ring normally regardless of this lock, it just
+    defers that one remove() call until the lock lifts again (see
+    resume_effects), which for a ring already most of the way through
+    its 2s life by the time a fade/slide starts is rarely more than a
+    beat away anyway."""
     for disc in extras:
         disc.clear_updaters()
     if hasattr(extras, "lock_rings"):
