@@ -86,13 +86,17 @@ from manim import (
 # that plays out), not resolution, since this assignment runs at import
 # time and overrides whatever resolution the flag set. Set LOW_RES=1 to
 # drop actual pixel count too, for fast layout-only iteration where frame
-# fidelity doesn't matter, or MID_RES=1 for a halfway point between the two.
+# fidelity doesn't matter, MID_RES=1 for a halfway point between the two,
+# or HD_RES=1 for a step up from MID_RES that's still short of full 1080p.
 if os.environ.get("LOW_RES", "0") == "1":
     config.pixel_width = 480
     config.pixel_height = 270
 elif os.environ.get("MID_RES", "0") == "1":
     config.pixel_width = 960
     config.pixel_height = 540
+elif os.environ.get("HD_RES", "0") == "1":
+    config.pixel_width = 1280
+    config.pixel_height = 720
 else:
     config.pixel_width = 1920
     config.pixel_height = 1080
@@ -1039,6 +1043,27 @@ def spawn_pulse_ring(node, color, max_growth_mult=1.6, duration=2.0, peak_opacit
     ring = Circle(radius=current_radius(), stroke_color=color, stroke_width=2.4, fill_opacity=0)
     ring.move_to(node.get_center())
     ring.set_z_index(2)  # matches extras -- see build_net's layering comment
+    # A no-op updater, purely so Scene.get_moving_mobjects() sees this
+    # ring as having a family updater and keeps re-rendering it every
+    # frame. Without this, a ring with zero updaters attached (its real
+    # animation lives entirely on the driver/tick now, not on the ring
+    # itself) gets treated by manim as a "static" mobject for any
+    # self.play() call where it isn't itself the direct target -- the
+    # slide targets next_net as a whole, not this ring individually --
+    # and static mobjects are rendered once and reused as a cached
+    # background for that entire animation, so tick()'s own frame-by-
+    # frame become()/move_to() calls kept computing the right numbers
+    # but were never actually redrawn until the *next* self.play() call
+    # recomputed the moving/static split from scratch. Confirmed as the
+    # cause of "rings freeze during the slide, then a batch of stale
+    # ones suddenly disappear once fresh ones start" -- the freeze was
+    # the stale cached frame, and the disappearance was rendering
+    # finally catching up to whatever tick() had already computed in
+    # the background (commonly fully faded out by then). This updater
+    # does nothing and touches no shared state, so there's nothing for
+    # Animation's own ghost-tick (see this function's docstring above)
+    # to double up on even if it fires an extra time.
+    ring.add_updater(lambda mob, dt: None)
     state = {"t": 0.0}
 
     def tick(dt):
@@ -1176,6 +1201,9 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
         if not SIMPLE_STYLE and not state["rings_locked"]:
             ring, ring_tick = spawn_pulse_ring(node_list[idx], core_color)
             extras.ring_holder.add(ring)
+            if DEBUG_PULSE:
+                ring._debug_id = id(ring) % 10000
+                print(f"RING tag={debug_tag} SPAWN id={ring._debug_id} clock={debug_clock['t']:.4f}", flush=True)
             state["active_rings"].append([ring, ring_tick, False])
         state["flash_queue"].append([FLASH_DELAY, idx])
 
@@ -1220,16 +1248,48 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
         # ghost-ticked an extra time per frame for as long as that
         # animation runs, roughly doubling its own growth/fade speed
         # (confirmed directly: exactly the "pings sped up while the
-        # other net moves" symptom). Once a ring finishes (tick returns
-        # True), it's ticked no further -- only actually removed from
-        # ring_holder once rings_locked has lifted (removing changes
-        # ring_holder's own family size, the one operation here that
-        # still isn't safe mid-whole-net-animation).
+        # other net moves" symptom).
+        #
+        # Kept ticking every frame even after it finishes (tick() at
+        # progress>=1 just keeps re-asserting the same fully-faded,
+        # max-radius state -- cheap and idempotent) rather than left
+        # alone once finished, which an earlier version of this did.
+        # That let a *different* reset sneak in underneath: the very
+        # Animation this ring's net is riding along in (the slide, or a
+        # FadeOut) calls Animation.finish() on itself once done, which
+        # forcibly resets every family member -- this ring included --
+        # back to a snapshot taken when that animation *began*, i.e.
+        # whatever partial radius/opacity the ring had way back then,
+        # not however far it had actually faded by the time it finished.
+        # With no further tick() to immediately re-correct that (since
+        # this ring was already marked finished and skipped), the ring
+        # sat there rendering that stale, partially-visible snapshot for
+        # however long it remained locked, then vanished all at once the
+        # moment it was finally removed -- confirmed directly against an
+        # instrumented log: rings whose own data already said
+        # opacity=0.0 at FINISH time were still being reset visually and
+        # only really disappearing, in a batch, once unlocked. Ticking
+        # unconditionally means that reset gets overwritten again on the
+        # very next frame, same as it would for a still-growing ring.
         still_active = []
         for ring, ring_tick, finished in state["active_rings"]:
-            if not finished:
-                finished = ring_tick(dt)
+            was_finished = finished
+            finished = ring_tick(dt) or finished
+            if DEBUG_PULSE and finished and not was_finished:
+                print(
+                    f"RING tag={debug_tag} FINISH id={getattr(ring, '_debug_id', '?')} "
+                    f"clock={debug_clock['t']:.4f} locked={state['rings_locked']} "
+                    f"opacity={ring.stroke_opacity if hasattr(ring, 'stroke_opacity') else '?'} "
+                    f"radius={ring.width/2:.4f}",
+                    flush=True,
+                )
             if finished and not state["rings_locked"]:
+                if DEBUG_PULSE:
+                    print(
+                        f"RING tag={debug_tag} REMOVE id={getattr(ring, '_debug_id', '?')} "
+                        f"clock={debug_clock['t']:.4f}",
+                        flush=True,
+                    )
                 extras.ring_holder.remove(ring)
             else:
                 still_active.append([ring, ring_tick, finished])
