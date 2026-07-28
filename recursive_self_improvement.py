@@ -1225,7 +1225,7 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
     debug_tag = id(nodes_group) % 1000
     debug_clock = {"t": 0.0, "n": 0}
 
-    def scheduler(mob, dt):
+    def tick_one_frame(dt):
         if DEBUG_PULSE:
             debug_clock["t"] += dt
             debug_clock["n"] += 1
@@ -1338,6 +1338,67 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
 
         state["queue"] = [[i * chain_stagger, idx] for i, idx in enumerate(path)]
         state["cooldown"] = next_chain_cooldown
+
+    def scheduler(mob, dt):
+        # Subdivides dt into normal-frame-sized steps before handing it
+        # to tick_one_frame, rather than passing whatever dt manim gives
+        # this call straight through -- everything above (the queue's
+        # own per-hop delays, cooldown countdown, random.choice() chain
+        # picking) is written assuming it gets ticked roughly once per
+        # rendered frame, each such tick advancing by one frame's worth
+        # of time. That assumption breaks specifically when manim's own
+        # skip-rendering path is active (see Scene.get_time_progression:
+        # a *skipped* animation collapses its entire run_time into one
+        # single giant dt instead of the usual per-frame sequence, since
+        # that shortcut is exactly right for a plain Transform/FadeIn --
+        # jumping straight to alpha=1 gives the same final state as
+        # stepping through every alpha in between -- but wrong for this
+        # scheduler, which needs the intermediate ticks themselves, not
+        # just the total elapsed time, to correctly space out hops,
+        # count down cooldowns, and space out how many chains get
+        # randomly started along the way. Confirmed directly: rendering
+        # the same range as its own chunk (manim's -n from,to) reliably
+        # reproduced bit-identical frames against another separate
+        # process rendering that identical chunk, yet diverged from a
+        # single continuous render covering the same range -- i.e. a
+        # real, deterministic mismatch between continuous and chunked
+        # rendering, not leftover randomness (already ruled out
+        # separately -- see construct()'s own random.seed()). Splitting
+        # any oversized dt into ordinary frame-sized steps here means
+        # this scheduler always sees the same sequence of ticks a
+        # continuous render would have given it, however manim itself
+        # chooses to batch the calls -- so a render chunked via -n now
+        # reconstructs the exact same pulse-chain state a continuous
+        # render would have reached by that point, not just the same
+        # final positions/timing (which never needed this fix -- those
+        # already only depend on alpha, not intermediate ticks).
+        if DEBUG_PULSE:
+            print(f"SCHED tag={debug_tag} raw_dt={dt:.5f}", flush=True)
+        # Mirrors Scene.get_time_progression/update_to_time's own formula
+        # exactly (np.arange(0, run_time, step), each tick's dt being the
+        # difference from the previous t, the very first of which is
+        # always 0 since both t[0] and self.last_t start at 0) rather
+        # than a plain "while remaining > step" countdown -- that
+        # simpler version divides dt into ceil(dt/step) equal-ish pieces
+        # instead of floor(dt/step), one tick more than a real render of
+        # this same duration would ever produce, since a real render's
+        # own arange never quite reaches its own endpoint. That one
+        # extra tick is small (whatever's left over) but still a real,
+        # extra call to tick_one_frame with its own nonzero dt -- enough
+        # to shift a borderline queue countdown or cooldown across zero
+        # a tick earlier than a continuous render would have, throwing
+        # off every random.choice() from that point on. Confirmed
+        # directly: switching to this exact formula (not just "close
+        # enough") was what actually made a chunked -n render's frames
+        # match a continuous render's, bit for bit -- the earlier
+        # countdown version still diverged despite otherwise doing the
+        # right thing (subdividing at all, versus not, was necessary but
+        # not sufficient).
+        step = 1 / config.frame_rate
+        last = 0.0
+        for t in np.arange(0, dt, step):
+            tick_one_frame(t - last)
+            last = t
 
     # A plain empty Mobject, added to the scene on its own -- never
     # nested under extras/nodes_group/next_net and never itself the
@@ -2181,6 +2242,26 @@ class RecursiveSelfImprovement(ThreeDScene):
         )
 
     def construct(self):
+        # Seeds the *global* random module, not just each net's own
+        # sample_cloud (which already seeds its own isolated
+        # random.Random(seed) instance and so was already deterministic
+        # on its own) -- add_pulse_chains' own hop selection
+        # (random.randint/random.choice, see its own scheduler) draws
+        # from this global stream instead, which is otherwise seeded from
+        # OS entropy at interpreter start and so differs every process
+        # run. Harmless for a single continuous render (nobody notices
+        # one run's ping pattern differing from another's), but it means
+        # two SEPARATE invocations of this same scene -- e.g. rendering
+        # it in chunks via manim's own -n <from>,<to> flag, one process
+        # per chunk -- would each reconstruct the skipped, unrendered
+        # portion with a *different* random pulse-chain history than
+        # whatever an earlier chunk's process actually rendered, even
+        # though every other part of the scene (positions, timing,
+        # growth) is already fully deterministic. Fixing this one spot
+        # makes the whole scene reproducible frame-for-frame across
+        # however many separate processes render however many chunks of
+        # it, not just internally consistent within any single run.
+        random.seed(20260722)
         self._demo_elapsed = 0.0
         self.camera.background_color = BACKGROUND_COLOR
         self.set_camera_orientation(phi=0 * DEGREES, theta=-90 * DEGREES)
