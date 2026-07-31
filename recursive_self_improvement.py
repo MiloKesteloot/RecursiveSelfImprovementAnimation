@@ -136,6 +136,52 @@ INTRO_ONLY = os.environ.get("INTRO_ONLY", "0") == "1"
 # chain alone without paying for the intro too.
 MAIN_ONLY = os.environ.get("MAIN_ONLY", "0") == "1"
 
+# Set FINAL_ONLY=1 to render just the closing beat of mini-movie 2: the
+# huge final net growing in from off-screen, sitting, then everything
+# fading away -- skipping mini-movie 1 entirely and, within mini-movie 2,
+# skipping net 0's own grow-in and every earlier stage's lap (arrow/code/
+# arrow/net-grow/slide) that would normally run first. The net that
+# would have slid into the "current" left slot by the time the final lap
+# starts is instead built directly in that exact spot (same position math
+# the skipped loop's own last iteration would have landed on) and grown
+# in near-instantly, so the final lap's arrow/code/arrow/final-net beat
+# plays out completely unchanged, just without paying to animate through
+# every earlier stage to get there. Implies MAIN_ONLY (mini-movie 1 never
+# runs either way).
+FINAL_ONLY = os.environ.get("FINAL_ONLY", "0") == "1"
+
+# Set FINAL_HOLD_SECONDS to override how long the final net sits (see
+# construct_main's final lap, INCLUDE_FINALE=0 branch) before fading away
+# -- defaults to the real scripted 15s, but a quick chain-timing check
+# doesn't need to sit through the full real duration to see whether hops
+# look right.
+FINAL_HOLD_SECONDS = float(os.environ.get("FINAL_HOLD_SECONDS", "15") or 15)
+
+# Set LAP_ONLY=1 to render just one lap's own arrival beat: the right-
+# hand net growing in, holding, sliding into the left slot, and the very
+# next lap's own left arrow growing in response -- nothing before (net
+# 0's own grow-in and this lap's arrow/code/arrow build-up leading up to
+# that net are placed instantly rather than animated -- present, since
+# the slide needs something concrete to fade away, just not performed)
+# and nothing after (the render stops the instant that next arrow
+# finishes, before that lap's own code/net get a chance to start).
+# Implies MAIN_ONLY (mini-movie 1 never runs either way).
+LAP_ONLY = os.environ.get("LAP_ONLY", "0") == "1"
+
+# Set CHAIN_TEST=1 (meant to be combined with FINAL_ONLY) to strip the
+# final lap down to just the final net itself, for the fastest possible
+# look at pulse-chain timing/density with nothing else competing for
+# render time: the code/brace/arrows are still built (their geometry is
+# what the net's own position is solved against) but never played/added
+# to the scene, so they cost nothing and never appear; edges are still
+# built (add_pulse_chains needs them for its adjacency graph) but never
+# faded in, so they're never drawn either; and the closing FadeOut is
+# skipped entirely -- the render just ends right after the hold. Node
+# radius is also shrunk (see CHAIN_TEST_NODE_SCALE below). Not a style
+# meant to ship, same as SIMPLE_STYLE/EDGES_ONLY/etc. above.
+CHAIN_TEST = os.environ.get("CHAIN_TEST", "0") == "1"
+CHAIN_TEST_NODE_SCALE = 0.6
+
 # Set SIMPLE_STYLE=1 to strip every node down to one flat circle and every
 # edge down to one flat line -- no glow discs, no glow blob, and pings
 # read as a plain node flash with no expanding ring (see fire()'s own
@@ -146,11 +192,19 @@ MAIN_ONLY = os.environ.get("MAIN_ONLY", "0") == "1"
 SIMPLE_STYLE = os.environ.get("SIMPLE_STYLE", "0") == "1"
 
 # Set FLASH_COLOR to a hex color to override every ping's flash color
-# (normally each net's own near-white palette core color) -- a one-off
+# (normally each net's own near-white palette core color, or plain red
+# under SIMPLE_STYLE -- see SIMPLE_STYLE_FLASH_COLOR) -- a one-off
 # override for previews where that near-white flash is hard to see
 # against the background, without touching the actual palette colors
 # used everywhere else (node fill, edges, arrows).
 FLASH_COLOR_OVERRIDE = os.environ.get("FLASH_COLOR") or None
+
+# What SIMPLE_STYLE (see below) flashes a node to when it fires, instead
+# of Bloom Pulse's own near-white palette core -- a plain, fixed, clearly
+# visible red for every net regardless of that net's own palette, since
+# SIMPLE_STYLE has no surrounding glow/ring to sell a near-white flash as
+# a "hot" version of the node's own color the way Bloom Pulse does.
+SIMPLE_STYLE_FLASH_COLOR = "#FF3B30"
 
 # Set EDGES_ONLY=1 to make node circles fully transparent -- geometry,
 # layout, and edge attachment are all unaffected (edges read node
@@ -1147,6 +1201,12 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
     for small nets (fewer than SMALL_NET_THRESHOLD nodes), which have so
     little to hop across that the default gap reads as spammy.
 
+    How many such chains run concurrently scales with net size (see
+    num_chains/NODES_PER_CHAIN below): a handful of nodes gets the
+    original single chain, but a several-hundred-node net runs a dozen
+    or more independent chains at once, so it reads as a genuinely busy
+    net instead of one lone chain wandering a mostly-idle crowd.
+
     The scheduler (and every node's own flash tick, see add_node_flash)
     lives on one dedicated, invisible "driver" mobject added straight to
     the scene -- not on `extras` and not on the nodes themselves -- and
@@ -1157,7 +1217,16 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
     when a net was growing in or sliding. A driver nobody ever animates
     has no such ghost copy, so it only ever ticks once per real frame."""
     core_color, mid_color = palette[0], palette[1]
-    flash_color = FLASH_COLOR_OVERRIDE or core_color
+    # Bloom Pulse's own flash target is each net's near-white palette core
+    # -- reads as "white hot" against that node's own glow/ring, which
+    # SIMPLE_STYLE has neither of (see its own module-level comment), so
+    # the same near-white flash there just reads as flashing white with
+    # nothing to sell it as a "hot" version of the node's own color.
+    # SIMPLE_STYLE therefore flashes to a plain, fixed red instead --
+    # matching the plain "the circle just flashes red" description this
+    # style is meant to give -- regardless of which net's own palette
+    # (green/blue/red/etc.) the node otherwise belongs to.
+    flash_color = FLASH_COLOR_OVERRIDE or (SIMPLE_STYLE_FLASH_COLOR if SIMPLE_STYLE else core_color)
     node_list = list(nodes_group)
     SMALL_NET_THRESHOLD = 6
     next_chain_cooldown = 0.9 if len(node_list) < SMALL_NET_THRESHOLD else 0.5
@@ -1207,21 +1276,43 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
             state["active_rings"].append([ring, ring_tick, False])
         state["flash_queue"].append([FLASH_DELAY, idx])
 
-    # queue holds [time_remaining, node_index] for hops still waiting to
-    # fire; cooldown counts down to the next chain once the queue drains.
-    # flash_queue holds the same shape for flashes waiting on FLASH_DELAY.
-    # Initial cooldown is zero -- this is attached right as a net finishes
-    # growing in (or right after it slides into place), so the first
-    # chain should fire the instant that happens, not after a pause.
-    # rings_locked starts False -- grow-in doesn't need it (see fire()'s
-    # own comment) -- stop_effects/resume_effects (see below) toggle it
-    # around the one remaining unsafe window, a whole-net animation.
-    # active_rings holds [ring, tick, finished] for every ring still
-    # being tracked -- finished flips to True once tick() reports the
-    # ring is done growing/fading, but it stays in this list (ticked no
-    # further) until it's actually safe to remove from ring_holder (see
-    # the scheduler's own active_rings loop below).
-    state = {"cooldown": 0.0, "queue": [], "flash_queue": [], "rings_locked": False, "active_rings": []}
+    # Each entry in chain_states runs its own independent chain -- its own
+    # queue (holding [time_remaining, node_index] for hops still waiting
+    # to fire) and its own cooldown (counting down to that chain's next
+    # hop-path once its queue drains) -- so multiple chains can be
+    # in-flight across the net at once instead of only ever one at a
+    # time. How many run concurrently scales with net size: a small net
+    # (few nodes to hop across) gets by fine with one, but a net with
+    # hundreds of nodes needs several running at once to read as busy
+    # rather than sparse -- one lone chain wandering a few hundred mostly-
+    # idle nodes just reads as broken, not calm. Initial cooldown is
+    # staggered slightly across chains (chain_idx * chain_stagger) rather
+    # than all zero -- this is attached right as a net finishes growing
+    # in (or right after it slides into place), so the first chains
+    # should all start right away, just not on the exact same frame as
+    # each other, which read as a single synchronized flash-burst instead
+    # of independently wandering chains.
+    NODES_PER_CHAIN = 30
+    num_chains = max(1, len(node_list) // NODES_PER_CHAIN)
+    chain_states = [{"cooldown": chain_idx * chain_stagger, "queue": []} for chain_idx in range(num_chains)]
+
+    # flash_queue holds the same [time_remaining, node_index] shape as a
+    # chain's own queue, for flashes waiting on FLASH_DELAY -- shared
+    # across every chain since a flash is a per-node effect, not a
+    # per-chain one. rings_locked starts False -- grow-in doesn't need it
+    # (see fire()'s own comment) -- stop_effects/resume_effects (see
+    # below) toggle it around the one remaining unsafe window, a
+    # whole-net animation. active_rings holds [ring, tick, finished] for
+    # every ring still being tracked -- finished flips to True once
+    # tick() reports the ring is done growing/fading, but it stays in
+    # this list (ticked no further) until it's actually safe to remove
+    # from ring_holder (see the scheduler's own active_rings loop below).
+    # Both are also shared across every chain for the same reason.
+    # elapsed/ticked_through drive the scheduler's own dt subdivision (see
+    # scheduler below) -- kept here, alongside the rest of this net's
+    # mutable state, so they persist across every separate real-frame call
+    # rather than resetting each time.
+    state = {"flash_queue": [], "rings_locked": False, "active_rings": [], "elapsed": 0.0, "ticked_through": 0.0}
     debug_tag = id(nodes_group) % 1000
     debug_clock = {"t": 0.0, "n": 0}
 
@@ -1304,101 +1395,104 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
                 pending_flash.append([delay, idx])
         state["flash_queue"] = pending_flash
 
-        pending = []
-        for delay, idx in state["queue"]:
-            delay -= dt
-            if delay <= 0:
-                if DEBUG_PULSE:
-                    print(f"PULSE tag={debug_tag} FIRE clock={debug_clock['t']:.4f} idx={idx}", flush=True)
-                fire(idx)
-            else:
-                pending.append([delay, idx])
-        state["queue"] = pending
+        # Each chain advances independently -- its own queue drains (or
+        # doesn't) and its own cooldown counts down (or doesn't) without
+        # any of that affecting the other chains' own state, so however
+        # many chains num_chains set up all keep hopping/cooling down/
+        # restarting on their own separate schedules.
+        for chain in chain_states:
+            pending = []
+            for delay, idx in chain["queue"]:
+                delay -= dt
+                if delay <= 0:
+                    if DEBUG_PULSE:
+                        print(f"PULSE tag={debug_tag} FIRE clock={debug_clock['t']:.4f} idx={idx}", flush=True)
+                    fire(idx)
+                else:
+                    pending.append([delay, idx])
+            chain["queue"] = pending
 
-        if state["queue"]:
-            return
-        state["cooldown"] -= dt
-        if state["cooldown"] > 0:
-            return
+            if chain["queue"]:
+                continue
+            chain["cooldown"] -= dt
+            if chain["cooldown"] > 0:
+                continue
 
-        length = random.randint(3, 5)
-        current = random.randrange(len(node_list))
-        path = [current]
-        visited = {current}
-        for _ in range(length - 1):
-            unvisited = [n for n in adjacency[current] if n not in visited]
-            if not unvisited:
-                # Dead end -- every neighbor (including wherever this hop
-                # just came from) is already visited. The chain just ends
-                # here rather than bouncing back the way it came.
-                break
-            current = random.choice(unvisited)
-            path.append(current)
-            visited.add(current)
+            length = random.randint(3, 5)
+            current = random.randrange(len(node_list))
+            path = [current]
+            visited = {current}
+            for _ in range(length - 1):
+                unvisited = [n for n in adjacency[current] if n not in visited]
+                if not unvisited:
+                    # Dead end -- every neighbor (including wherever this
+                    # hop just came from) is already visited. The chain
+                    # just ends here rather than bouncing back the way it
+                    # came.
+                    break
+                current = random.choice(unvisited)
+                path.append(current)
+                visited.add(current)
 
-        state["queue"] = [[i * chain_stagger, idx] for i, idx in enumerate(path)]
-        state["cooldown"] = next_chain_cooldown
+            chain["queue"] = [[hop * chain_stagger, idx] for hop, idx in enumerate(path)]
+            chain["cooldown"] = next_chain_cooldown
 
     def scheduler(mob, dt):
-        # Subdivides dt into normal-frame-sized steps before handing it
-        # to tick_one_frame, rather than passing whatever dt manim gives
-        # this call straight through -- everything above (the queue's
-        # own per-hop delays, cooldown countdown, random.choice() chain
-        # picking) is written assuming it gets ticked roughly once per
-        # rendered frame, each such tick advancing by one frame's worth
-        # of time. That assumption breaks specifically when manim's own
-        # skip-rendering path is active (see Scene.get_time_progression:
-        # a *skipped* animation collapses its entire run_time into one
-        # single giant dt instead of the usual per-frame sequence, since
-        # that shortcut is exactly right for a plain Transform/FadeIn --
-        # jumping straight to alpha=1 gives the same final state as
-        # stepping through every alpha in between -- but wrong for this
-        # scheduler, which needs the intermediate ticks themselves, not
-        # just the total elapsed time, to correctly space out hops,
-        # count down cooldowns, and space out how many chains get
-        # randomly started along the way. Confirmed directly: rendering
-        # the same range as its own chunk (manim's -n from,to) reliably
-        # reproduced bit-identical frames against another separate
-        # process rendering that identical chunk, yet diverged from a
-        # single continuous render covering the same range -- i.e. a
-        # real, deterministic mismatch between continuous and chunked
-        # rendering, not leftover randomness (already ruled out
-        # separately -- see construct()'s own random.seed()). Splitting
-        # any oversized dt into ordinary frame-sized steps here means
-        # this scheduler always sees the same sequence of ticks a
-        # continuous render would have given it, however manim itself
-        # chooses to batch the calls -- so a render chunked via -n now
-        # reconstructs the exact same pulse-chain state a continuous
-        # render would have reached by that point, not just the same
-        # final positions/timing (which never needed this fix -- those
-        # already only depend on alpha, not intermediate ticks).
+        # Subdivides elapsed time into normal-frame-sized steps before
+        # handing it to tick_one_frame, rather than passing whatever dt
+        # manim gives this call straight through -- everything above (the
+        # queue's own per-hop delays, cooldown countdown, random.choice()
+        # chain picking) is written assuming it gets ticked in clean,
+        # frame-sized increments, not whatever raw dt a given call happens
+        # to carry. That matters for two different reasons: manim's own
+        # skip-rendering path (see Scene.get_time_progression) can collapse
+        # a whole skipped stretch into one giant dt instead of the usual
+        # per-frame sequence, which this scheduler needs subdivided back
+        # into individual ticks to keep hop spacing/cooldowns/chain-start
+        # randomness correct; and, in the far more common case, THIS
+        # updater is called fresh once per real rendered frame with its own
+        # separate dt each time (not once for a whole animation the way
+        # Scene.get_time_progression itself is called), so any subdivision
+        # scheme has to track elapsed time cumulatively *across* calls, not
+        # reset its own bookkeeping at the start of every single one.
+        #
+        # An earlier version of this got that second part wrong: it reset
+        # a local `last = 0.0` at the top of every call and did
+        # `for t in np.arange(0, dt, step): tick_one_frame(t - last)`.
+        # That formula is only correct when applied ONCE across a whole
+        # span of elapsed time (which is what it mirrors -- Scene.
+        # get_time_progression's own np.arange(0, run_time, step) is
+        # called once per Animation, not once per frame). Called fresh
+        # every real frame instead, with dt almost always <= one step,
+        # np.arange(0, dt, step) collapsed to the single element [0.0]
+        # every time -- so tick_one_frame(0.0 - 0.0) = tick_one_frame(0.0),
+        # a pure no-op, on nearly every real frame. Confirmed directly
+        # against a DEBUG_PULSE trace: 3-4 wasted zero-dt ticks for every
+        # 1 real tick, and confirmed visually too -- two frames a tenth of
+        # a second apart, pixel-identical. Chains still eventually hopped
+        # (whenever floating-point drift happened to push a call's raw dt
+        # just over one step, np.arange produced a second, nonzero-dt
+        # element), just at a small fraction of the real rate -- exactly
+        # the "moves node to node at ~1/sec instead of ~0.2s" symptom.
+        #
+        # Fixed by tracking elapsed/ticked_through on this net's own
+        # persistent `state` (set up alongside flash_queue/rings_locked/
+        # active_rings above) instead of a call-local variable: every call
+        # adds its own dt to the running total, and the loop below emits
+        # exactly one step-sized tick_one_frame(step) for every full step
+        # boundary that total has newly crossed since the last call --
+        # one tick for an ordinary single-frame call, several in a row for
+        # a skip-collapsed multi-frame one, and zero real time ever
+        # dropped in between, matching floor(elapsed/step) ticks overall
+        # the same way the original np.arange formula intended, just
+        # correctly accumulated across calls instead of reset by them.
         if DEBUG_PULSE:
             print(f"SCHED tag={debug_tag} raw_dt={dt:.5f}", flush=True)
-        # Mirrors Scene.get_time_progression/update_to_time's own formula
-        # exactly (np.arange(0, run_time, step), each tick's dt being the
-        # difference from the previous t, the very first of which is
-        # always 0 since both t[0] and self.last_t start at 0) rather
-        # than a plain "while remaining > step" countdown -- that
-        # simpler version divides dt into ceil(dt/step) equal-ish pieces
-        # instead of floor(dt/step), one tick more than a real render of
-        # this same duration would ever produce, since a real render's
-        # own arange never quite reaches its own endpoint. That one
-        # extra tick is small (whatever's left over) but still a real,
-        # extra call to tick_one_frame with its own nonzero dt -- enough
-        # to shift a borderline queue countdown or cooldown across zero
-        # a tick earlier than a continuous render would have, throwing
-        # off every random.choice() from that point on. Confirmed
-        # directly: switching to this exact formula (not just "close
-        # enough") was what actually made a chunked -n render's frames
-        # match a continuous render's, bit for bit -- the earlier
-        # countdown version still diverged despite otherwise doing the
-        # right thing (subdividing at all, versus not, was necessary but
-        # not sufficient).
         step = 1 / config.frame_rate
-        last = 0.0
-        for t in np.arange(0, dt, step):
-            tick_one_frame(t - last)
-            last = t
+        state["elapsed"] += dt
+        while state["elapsed"] - state["ticked_through"] >= step:
+            state["ticked_through"] += step
+            tick_one_frame(step)
 
     # A plain empty Mobject, added to the scene on its own -- never
     # nested under extras/nodes_group/next_net and never itself the
@@ -1438,6 +1532,56 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
         state["rings_locked"] = True
 
     def unlock_rings():
+        # Flushed immediately, synchronously, right here -- rather than
+        # just clearing the lock and letting this net's own driver
+        # correct things whenever its next real-frame tick happens to
+        # land -- to close a one-frame gap that reads as "a bunch of
+        # rings appear out of nowhere and then disappear" right as a net
+        # settles into place after a slide.
+        #
+        # A slide is `next_net.animate.shift(...)` -- a Transform-family
+        # animation over next_net's *entire* family, ring_holder and its
+        # locked rings included. Transform re-interpolates every family
+        # member every frame it's running (Scene.update_to_time calls
+        # animation.interpolate(alpha) before the scene's own
+        # per-mobject updater pass, so this net's own driver tick -- part
+        # of that later pass -- still gets the last, correct word on
+        # every one of those frames), but manim also calls
+        # animation.finish() -> interpolate(1) once more right as the
+        # slide's self.play() call itself returns, this time with no
+        # further driver tick queued up to immediately re-correct it
+        # (the next one only comes whenever the *next* self.play's own
+        # frame loop happens to reach a real per-frame update). A ring
+        # that fully faded mid-slide -- locked the whole time, so never
+        # removed -- gets reset by that stray extra interpolate() back to
+        # whatever it looked like at the *start* of the slide (a
+        # `.animate.shift()` only ever changes position between its start
+        # and target snapshots, never style, so style stays frozen at
+        # its start-of-slide snapshot for as long as nothing else
+        # touches it): bright and mid-animation again, not faded. With
+        # nothing else rendered in between, that reset is exactly what
+        # the next actual frame shows -- then this same net's next real
+        # tick (from whatever self.play comes after) sees it's finished,
+        # unlocked, and removes it outright, before that frame renders.
+        # Two consecutive frames, wrong-then-gone, is exactly the
+        # flicker being described.
+        #
+        # Ticking with dt=0 re-asserts the ring's *true* current
+        # radius/opacity (driven by this ring's own state["t"], which
+        # finish()'s reset never touched -- only the ring's manim-side
+        # geometry/style was clobbered) immediately, before any further
+        # rendering happens, and removes it outright if that leaves it
+        # finished -- so by the time a frame actually gets drawn, either
+        # is true: the ring is back to correctly reflecting its own real
+        # progress, or it's already gone. Never the stale snapshot.
+        still_active = []
+        for ring, ring_tick, finished in state["active_rings"]:
+            finished = ring_tick(0) or finished
+            if finished:
+                extras.ring_holder.remove(ring)
+            else:
+                still_active.append([ring, ring_tick, finished])
+        state["active_rings"] = still_active
         state["rings_locked"] = False
 
     extras.lock_rings = lock_rings
@@ -2201,11 +2345,16 @@ class RecursiveSelfImprovement(ThreeDScene):
         index_of = {id(n): i for i, n in enumerate(node_list)}
         last_index = max(len(node_list) - 1, 1)
         edge_fade_ins = []
-        for edge in edges_group:
-            i, j = index_of[id(edge.node_a)], index_of[id(edge.node_b)]
-            delay_frac = max(i, j) / last_index
-            wait_time = delay_frac * run_time * 0.7
-            edge_fade_ins.append(Succession(Wait(wait_time), FadeIn(edge, run_time=run_time - wait_time)))
+        # CHAIN_TEST skips fading edges in at all -- they still exist in
+        # edges_group (add_pulse_chains needs them for its adjacency
+        # graph), just never get animated/added to the scene, so they're
+        # never drawn.
+        if not CHAIN_TEST:
+            for edge in edges_group:
+                i, j = index_of[id(edge.node_a)], index_of[id(edge.node_b)]
+                delay_frac = max(i, j) / last_index
+                wait_time = delay_frac * run_time * 0.7
+                edge_fade_ins.append(Succession(Wait(wait_time), FadeIn(edge, run_time=run_time - wait_time)))
 
         # Started before the grow-in's own self.play (rather than after
         # it finishes) so the first pings can fire while nodes are still
@@ -2233,13 +2382,15 @@ class RecursiveSelfImprovement(ThreeDScene):
         # instead of fighting it -- see its docstring -- so nothing here
         # needs to touch suspend_mobject_updating at all any more.
         add_pulse_chains(self, nodes_group, edges_group, palette, extras)
-        self.play(
-            FadeIn(glow),
-            FadeIn(extras),
-            AnimationGroup(*edge_fade_ins),
-            LaggedStart(*[GrowFromCenter(n) for n in node_list], lag_ratio=0.04),
-            run_time=run_time,
-        )
+        # AnimationGroup() with zero subanimations raises outright (see
+        # manim's own Animation.begin()) rather than just being a no-op --
+        # CHAIN_TEST leaves edge_fade_ins empty on purpose (see above), so
+        # that piece is only included at all when there's something in it.
+        top_level = [FadeIn(glow), FadeIn(extras)]
+        if edge_fade_ins:
+            top_level.append(AnimationGroup(*edge_fade_ins))
+        top_level.append(LaggedStart(*[GrowFromCenter(n) for n in node_list], lag_ratio=0.04))
+        self.play(*top_level, run_time=run_time)
 
     def construct(self):
         # Seeds the *global* random module, not just each net's own
@@ -2280,7 +2431,7 @@ class RecursiveSelfImprovement(ThreeDScene):
         # 2, then a beat of plain blank background as a hard cut between
         # the two, then mini-movie 2 -- the full chain -- runs unchanged.
         try:
-            if not MAIN_ONLY:
+            if not MAIN_ONLY and not FINAL_ONLY and not LAP_ONLY:
                 self.construct_intro()
                 if INTRO_ONLY:
                     return
@@ -2381,112 +2532,184 @@ class RecursiveSelfImprovement(ThreeDScene):
         # ahead to a net's *next* lap, not just its current one.
         lap_radii = [stage["cloud_radius"] for stage in STAGES] + [FINAL_STAGE_RADIUS]
 
-        # Net 0 spawns on the left, green for its whole lifetime -- grown
-        # in at the same unhurried pace as the first loop iteration below,
-        # already positioned for lap 1's own code (and shifted to keep lap
-        # 1's whole composition centered, since net 0 and lap 1's own
-        # right-hand net are almost never the same size) so its arrow is
-        # exactly ARROW_LENGTH from the very first frame.
-        shift = lap_shift(lap_radii[0], lap_radii[1], lap_code_lines[0])
-        _, brace_left0 = code_edges_for(lap_code_lines[0])
-        current_net, current_nodes, current_edges, current_glow, current_extras = build_net(
-            center=np.array([left_net_center(STAGES[0]["cloud_radius"], brace_left0 + shift), 0, 0]),
-            palette=NET_PALETTES[0],
-            edge_color=NET_EDGE_COLORS[0],
-            **STAGES[0],
-        )
-        self.grow_in(
-            current_nodes,
-            current_edges,
-            current_glow,
-            current_extras,
-            STAGES[0]["node_radius"],
-            NET_PALETTES[0],
-            run_time=1.1 * SPEED_MULTIPLIERS[0],
-        )
-        self.hold(0.4 * SPEED_MULTIPLIERS[0])
-
-        # Left net -> left arrow -> code typing in behind a brace -> right
-        # arrow -> a bigger net (its own fixed color) grows on the right
-        # -> the left net, code, and arrows vanish while the right net
-        # slides into the left slot, becoming "current" for the next lap.
-        # Every beat in the lap is scaled by that lap's own multiplier, so
-        # early laps linger and later laps snap by increasingly fast.
-        for i, (stage, code_lines, m) in enumerate(zip(STAGES[1:], CODE_STAGES, SPEED_MULTIPLIERS), start=1):
+        if FINAL_ONLY:
+            # Skip net 0's own grow-in and every earlier stage's lap --
+            # jump straight to a net standing in the exact spot the
+            # skipped loop's own last iteration would have slid its net
+            # into (same position math as new_left_center/next_shift
+            # below, with is_final_next always True since this always
+            # stands in for the lap right before the final one), grown in
+            # near-instantly rather than at its normal pace. The final
+            # lap right below this still runs completely unchanged --
+            # arrow, code, arrow, the huge final net growing in from
+            # off-screen, then the hold and fade-away.
+            stage = STAGES[-1]
+            if CHAIN_TEST:
+                # A copy, not a mutation -- STAGES[-1] is a shared
+                # module-level dict, reused verbatim by the normal (non-
+                # FINAL_ONLY) loop too.
+                stage = dict(stage, node_radius=stage["node_radius"] * CHAIN_TEST_NODE_SCALE)
             stage_radius = stage["cloud_radius"]
-            shift = lap_shift(lap_radii[i - 1], lap_radii[i], code_lines)
-            code = make_code_block(code_lines, np.array([MID_X + shift, 0, 0]))
-            brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
-            left_arrow, right_arrow = flow_arrows(
-                left_facing_edge(brace.get_left()[0]), right_facing_edge(code.get_right()[0]), brace, code
-            )
-
-            self.play(grow_arrow(left_arrow), run_time=0.5 * m)
-            self.play(
-                write_code(code, m),
-                GrowFromCenter(brace, run_time=0.35 * m),
-            )
-            self.hold(0.4 * m)
-
-            self.play(grow_arrow(right_arrow), run_time=0.5 * m)
-
-            next_net, next_nodes, next_edges, next_glow, next_extras = build_net(
-                center=np.array([right_net_center(stage_radius, code.get_right()[0]), 0, 0]),
-                palette=NET_PALETTES[i],
-                edge_color=NET_EDGE_COLORS[i],
+            _, brace_left_final = code_edges_for(lap_code_lines[-1])
+            current_net, current_nodes, current_edges, current_glow, current_extras = build_net(
+                center=np.array([left_net_center(stage_radius, brace_left_final), 0, 0]),
+                palette=NET_PALETTES[-1],
+                edge_color=NET_EDGE_COLORS[-1],
                 **stage,
             )
             self.grow_in(
-                next_nodes, next_edges, next_glow, next_extras, stage["node_radius"], NET_PALETTES[i],
-                run_time=max(1.3 * m, 0.5),
+                current_nodes, current_edges, current_glow, current_extras, stage["node_radius"], NET_PALETTES[-1],
+                run_time=0.05,
             )
-            self.hold(0.5 * m)
+        elif LAP_ONLY:
+            # Net 0 placed near-instantly rather than at its normal pace
+            # -- same position math the normal net-0 setup below uses,
+            # just without paying to animate through it. The loop right
+            # below this still runs completely unchanged going into lap
+            # 1 -- its own arrow/code/arrow build-up is what gets skipped
+            # there (see the loop's own i==1 check), not anything here.
+            shift = lap_shift(lap_radii[0], lap_radii[1], lap_code_lines[0])
+            _, brace_left0 = code_edges_for(lap_code_lines[0])
+            current_net, current_nodes, current_edges, current_glow, current_extras = build_net(
+                center=np.array([left_net_center(STAGES[0]["cloud_radius"], brace_left0 + shift), 0, 0]),
+                palette=NET_PALETTES[0],
+                edge_color=NET_EDGE_COLORS[0],
+                **STAGES[0],
+            )
+            self.grow_in(
+                current_nodes, current_edges, current_glow, current_extras, STAGES[0]["node_radius"], NET_PALETTES[0],
+                run_time=0.05,
+            )
+        else:
+            # Net 0 spawns on the left, green for its whole lifetime --
+            # grown in at the same unhurried pace as the first loop
+            # iteration below, already positioned for lap 1's own code
+            # (and shifted to keep lap 1's whole composition centered,
+            # since net 0 and lap 1's own right-hand net are almost never
+            # the same size) so its arrow is exactly ARROW_LENGTH from the
+            # very first frame.
+            shift = lap_shift(lap_radii[0], lap_radii[1], lap_code_lines[0])
+            _, brace_left0 = code_edges_for(lap_code_lines[0])
+            current_net, current_nodes, current_edges, current_glow, current_extras = build_net(
+                center=np.array([left_net_center(STAGES[0]["cloud_radius"], brace_left0 + shift), 0, 0]),
+                palette=NET_PALETTES[0],
+                edge_color=NET_EDGE_COLORS[0],
+                **STAGES[0],
+            )
+            self.grow_in(
+                current_nodes,
+                current_edges,
+                current_glow,
+                current_extras,
+                STAGES[0]["node_radius"],
+                NET_PALETTES[0],
+                run_time=1.1 * SPEED_MULTIPLIERS[0],
+            )
+            self.hold(0.4 * SPEED_MULTIPLIERS[0])
 
-            # next_extras' *new* rings are locked here -- next_net is
-            # about to slide, and a ring spawning mid-slide would change
-            # ring_holder's family size while the slide is mid-
-            # interpolation over it and crash (see stop_effects' own
-            # docstring). Its flash/scheduler and any ring already in
-            # flight keep running right through the slide unchanged --
-            # resume_effects lifts the lock again once it's safe.
-            stop_effects(next_extras)
-            # current_net's new rings are locked here too -- right before
-            # it fades out for good, same as every other stop_effects
-            # call site -- but its flash/scheduler and any ring already in
-            # flight keep running (see stop_effects' own docstring), so
-            # the outgoing net keeps pinging, rings included, as it fades
-            # instead of visibly going quiet the moment the incoming net
-            # starts sliding.
-            stop_effects(current_extras)
-            # The lap right after this one is the final, deliberately-
-            # overflowing net -- centering the composition around it
-            # would try to drag everything sideways to "balance" a net
-            # many times bigger than its neighbor, instead of leaving
-            # the rest of that lap alone and letting only the final net
-            # spill off-screen. So no lap_shift lookahead for that one;
-            # plain shift=0 instead, matching the final lap's own below.
-            is_final_next = (i + 1 == len(STAGES))
-            next_shift = 0 if is_final_next else lap_shift(lap_radii[i], lap_radii[i + 1], lap_code_lines[i])
-            _, next_brace_left = code_edges_for(lap_code_lines[i])
-            new_left_center = left_net_center(stage_radius, next_brace_left + next_shift)
-            slide_shift = new_left_center - right_net_center(stage_radius, code.get_right()[0])
-            # Plain next_net.animate.shift() -- no suspend_mobject_updating
-            # override needed (see add_pulse_chains' own driver mobject and
-            # add_node_flash's docstring for why a plain .animate() no
-            # longer risks freezing or double-ticking anything).
-            self.play(
-                FadeOut(current_net),
-                FadeOut(code),
-                FadeOut(brace),
-                FadeOut(left_arrow),
-                FadeOut(right_arrow),
-                next_net.animate.shift(np.array([slide_shift, 0, 0])),
-                run_time=max(1.0 * m, 0.45),
-            )
-            resume_effects(next_extras)
-            current_net, current_nodes, current_edges, current_glow, current_extras = (
-                next_net, next_nodes, next_edges, next_glow, next_extras,
-            )
+        if not FINAL_ONLY:
+            # Left net -> left arrow -> code typing in behind a brace ->
+            # right arrow -> a bigger net (its own fixed color) grows on
+            # the right -> the left net, code, and arrows vanish while the
+            # right net slides into the left slot, becoming "current" for
+            # the next lap. Every beat in the lap is scaled by that lap's
+            # own multiplier, so early laps linger and later laps snap by
+            # increasingly fast. Runs for LAP_ONLY too (only FINAL_ONLY
+            # skips this loop outright) -- LAP_ONLY's own i==1/i==2 checks
+            # below are what skip/stop the parts it doesn't want, not this
+            # guard.
+            for i, (stage, code_lines, m) in enumerate(zip(STAGES[1:], CODE_STAGES, SPEED_MULTIPLIERS), start=1):
+                stage_radius = stage["cloud_radius"]
+                shift = lap_shift(lap_radii[i - 1], lap_radii[i], code_lines)
+                code = make_code_block(code_lines, np.array([MID_X + shift, 0, 0]))
+                brace = make_bracket(code, buff=0.25, color=ARROW_COLOR)
+                left_arrow, right_arrow = flow_arrows(
+                    left_facing_edge(brace.get_left()[0]), right_facing_edge(code.get_right()[0]), brace, code
+                )
+
+                if LAP_ONLY and i == 1:
+                    # The "before" this lap's own build-up leading up to
+                    # the net the user actually wants to see -- placed
+                    # instantly rather than animated, same reasoning as
+                    # net 0 above: the slide right below still needs
+                    # something concrete to fade away.
+                    self.add(code, brace, left_arrow, right_arrow)
+                else:
+                    self.play(grow_arrow(left_arrow), run_time=0.5 * m)
+                    if LAP_ONLY and i == 2:
+                        # The "after" -- this next lap's own left arrow
+                        # is the last beat the user wants; stop right
+                        # here, before its own code/net get a chance to
+                        # start.
+                        return
+                    self.play(
+                        write_code(code, m),
+                        GrowFromCenter(brace, run_time=0.35 * m),
+                    )
+                    self.hold(0.4 * m)
+
+                    self.play(grow_arrow(right_arrow), run_time=0.5 * m)
+
+                next_net, next_nodes, next_edges, next_glow, next_extras = build_net(
+                    center=np.array([right_net_center(stage_radius, code.get_right()[0]), 0, 0]),
+                    palette=NET_PALETTES[i],
+                    edge_color=NET_EDGE_COLORS[i],
+                    **stage,
+                )
+                self.grow_in(
+                    next_nodes, next_edges, next_glow, next_extras, stage["node_radius"], NET_PALETTES[i],
+                    run_time=max(1.3 * m, 0.5),
+                )
+                self.hold(0.5 * m)
+
+                # next_extras' *new* rings are locked here -- next_net is
+                # about to slide, and a ring spawning mid-slide would
+                # change ring_holder's family size while the slide is
+                # mid-interpolation over it and crash (see stop_effects'
+                # own docstring). Its flash/scheduler and any ring already
+                # in flight keep running right through the slide
+                # unchanged -- resume_effects lifts the lock again once
+                # it's safe.
+                stop_effects(next_extras)
+                # current_net's new rings are locked here too -- right
+                # before it fades out for good, same as every other
+                # stop_effects call site -- but its flash/scheduler and
+                # any ring already in flight keep running (see
+                # stop_effects' own docstring), so the outgoing net keeps
+                # pinging, rings included, as it fades instead of visibly
+                # going quiet the moment the incoming net starts sliding.
+                stop_effects(current_extras)
+                # The lap right after this one is the final, deliberately-
+                # overflowing net -- centering the composition around it
+                # would try to drag everything sideways to "balance" a net
+                # many times bigger than its neighbor, instead of leaving
+                # the rest of that lap alone and letting only the final
+                # net spill off-screen. So no lap_shift lookahead for that
+                # one; plain shift=0 instead, matching the final lap's own
+                # below.
+                is_final_next = (i + 1 == len(STAGES))
+                next_shift = 0 if is_final_next else lap_shift(lap_radii[i], lap_radii[i + 1], lap_code_lines[i])
+                _, next_brace_left = code_edges_for(lap_code_lines[i])
+                new_left_center = left_net_center(stage_radius, next_brace_left + next_shift)
+                slide_shift = new_left_center - right_net_center(stage_radius, code.get_right()[0])
+                # Plain next_net.animate.shift() -- no
+                # suspend_mobject_updating override needed (see
+                # add_pulse_chains' own driver mobject and
+                # add_node_flash's docstring for why a plain .animate() no
+                # longer risks freezing or double-ticking anything).
+                self.play(
+                    FadeOut(current_net),
+                    FadeOut(code),
+                    FadeOut(brace),
+                    FadeOut(left_arrow),
+                    FadeOut(right_arrow),
+                    next_net.animate.shift(np.array([slide_shift, 0, 0])),
+                    run_time=max(1.0 * m, 0.45),
+                )
+                resume_effects(next_extras)
+                current_net, current_nodes, current_edges, current_glow, current_extras = (
+                    next_net, next_nodes, next_edges, next_glow, next_extras,
+                )
 
         self.hold(0.4 * SPEED_MULTIPLIERS[-1])
 
@@ -2518,13 +2741,19 @@ class RecursiveSelfImprovement(ThreeDScene):
             left_facing_edge(brace.get_left()[0]), right_facing_edge(code.get_right()[0]), brace, code
         )
 
-        self.play(grow_arrow(left_arrow), run_time=0.5 * FINAL_CODE_MULT)
-        self.play(
-            write_code(code, FINAL_CODE_MULT),
-            GrowFromCenter(brace, run_time=0.35 * FINAL_CODE_MULT),
-        )
-        self.hold(0.4 * FINAL_CODE_MULT)
-        self.play(grow_arrow(right_arrow), run_time=0.5 * FINAL_CODE_MULT)
+        # CHAIN_TEST skips animating (and thereby ever displaying) the
+        # arrows/code/brace entirely -- code/brace/arrows above are still
+        # built since final_vertex_x/ico_center_x are solved from their
+        # geometry, just never played, so they cost nothing and never
+        # appear.
+        if not CHAIN_TEST:
+            self.play(grow_arrow(left_arrow), run_time=0.5 * FINAL_CODE_MULT)
+            self.play(
+                write_code(code, FINAL_CODE_MULT),
+                GrowFromCenter(brace, run_time=0.35 * FINAL_CODE_MULT),
+            )
+            self.hold(0.4 * FINAL_CODE_MULT)
+            self.play(grow_arrow(right_arrow), run_time=0.5 * FINAL_CODE_MULT)
 
         if INCLUDE_FINALE:
             ico_offset = np.array([ico_center_x, 0, 0])
@@ -2591,35 +2820,46 @@ class RecursiveSelfImprovement(ThreeDScene):
             # red, like the icosahedron it stands in for -- pinned by its
             # own pinch point (see final_vertex_x above) so it touches
             # the arrow the same way every other net's left edge does.
+            final_stage = FINAL_STAGE
+            if CHAIN_TEST:
+                # A copy, not a mutation -- FINAL_STAGE is a shared
+                # module-level dict.
+                final_stage = dict(FINAL_STAGE, node_radius=FINAL_STAGE["node_radius"] * CHAIN_TEST_NODE_SCALE)
             final_net, final_nodes, final_edges, final_glow, final_extras = build_net(
-                center=np.array([final_vertex_x, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **FINAL_STAGE
+                center=np.array([final_vertex_x, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **final_stage
             )
             self.grow_in(
-                final_nodes, final_edges, final_glow, final_extras, FINAL_STAGE["node_radius"], RED_PALETTE,
+                final_nodes, final_edges, final_glow, final_extras, final_stage["node_radius"], RED_PALETTE,
                 run_time=max(1.3 * FINAL_CODE_MULT, 0.5),
             )
-            self.hold(0.6)
+            self.hold(FINAL_HOLD_SECONDS)
 
-            # Each piece fades out on its own rather than as one
-            # synchronized block, and the backdrop stays put throughout --
-            # so this reads as the scene's pieces settling away, not the
-            # whole picture (background glow included) dimming to black.
-            # Both nets' new rings are locked here, right before they fade
-            # out for good (see stop_effects' own docstring) -- their
-            # flash/scheduler and any ring already in flight keep running
-            # right through the FadeOut, so both keep pinging, rings
-            # included, as they fade.
-            stop_effects(current_extras)
-            stop_effects(final_extras)
-            self.play(
-                LaggedStart(
-                    FadeOut(current_net),
-                    FadeOut(code),
-                    FadeOut(brace),
-                    FadeOut(left_arrow),
-                    FadeOut(right_arrow),
-                    FadeOut(final_net),
-                    lag_ratio=0.2,
-                ),
-                run_time=1.6,
-            )
+            # CHAIN_TEST ends the render right here, right after the hold
+            # -- skipping the closing fade-away entirely, since the point
+            # of this mode is just to see the chains pinging as fast as
+            # possible, not the full close-out beat.
+            if not CHAIN_TEST:
+                # Each piece fades out on its own rather than as one
+                # synchronized block, and the backdrop stays put
+                # throughout -- so this reads as the scene's pieces
+                # settling away, not the whole picture (background glow
+                # included) dimming to black. Both nets' new rings are
+                # locked here, right before they fade out for good (see
+                # stop_effects' own docstring) -- their flash/scheduler
+                # and any ring already in flight keep running right
+                # through the FadeOut, so both keep pinging, rings
+                # included, as they fade.
+                stop_effects(current_extras)
+                stop_effects(final_extras)
+                self.play(
+                    LaggedStart(
+                        FadeOut(current_net),
+                        FadeOut(code),
+                        FadeOut(brace),
+                        FadeOut(left_arrow),
+                        FadeOut(right_arrow),
+                        FadeOut(final_net),
+                        lag_ratio=0.2,
+                    ),
+                    run_time=1.6,
+                )
