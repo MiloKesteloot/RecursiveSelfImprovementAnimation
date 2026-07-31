@@ -81,13 +81,15 @@ from manim import (
     config,
 )
 
-# Fixed at 1920x1080 regardless of manim's own -ql/-qm/-qh flags -- those
-# only end up controlling fps here (see FULL_TIMING above them for how
-# that plays out), not resolution, since this assignment runs at import
-# time and overrides whatever resolution the flag set. Set LOW_RES=1 to
-# drop actual pixel count too, for fast layout-only iteration where frame
-# fidelity doesn't matter, MID_RES=1 for a halfway point between the two,
-# or HD_RES=1 for a step up from MID_RES that's still short of full 1080p.
+# Fixed at 1920x1080 by default regardless of manim's own -ql/-qm/-qh
+# flags -- those only end up controlling fps here (see FULL_TIMING above
+# them for how that plays out), not resolution, since this assignment
+# runs at import time and overrides whatever resolution the flag set.
+# Set LOW_RES=1 to drop actual pixel count too, for fast layout-only
+# iteration where frame fidelity doesn't matter, MID_RES=1 for a halfway
+# point between the two, HD_RES=1 for a step up from MID_RES that's
+# still short of full 1080p, or UHD_RES=1 for true 4K (2160p) -- combine
+# with manim's own -qh (60fps) for a full-quality 4K60 final render.
 if os.environ.get("LOW_RES", "0") == "1":
     config.pixel_width = 480
     config.pixel_height = 270
@@ -97,6 +99,9 @@ elif os.environ.get("MID_RES", "0") == "1":
 elif os.environ.get("HD_RES", "0") == "1":
     config.pixel_width = 1280
     config.pixel_height = 720
+elif os.environ.get("UHD_RES", "0") == "1":
+    config.pixel_width = 3840
+    config.pixel_height = 2160
 else:
     config.pixel_width = 1920
     config.pixel_height = 1080
