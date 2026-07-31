@@ -283,7 +283,12 @@ MAGENTA_EDGE = "#EF5AC8"
 MAGENTA_PALETTE = (MAGENTA_CORE, MAGENTA_MID, MAGENTA_GLOW)
 
 RED_CORE = "#FFECEC"
-RED_MID = "#FF9B9B"
+# More saturated than the other palettes' own MID (that pattern -- pale,
+# high-lightness, medium saturation -- reads fine on a cool hue, but red
+# specifically needs more saturation than that to still read as red
+# rather than salmon/orange once desaturated this far; the old FF9B9B
+# read as orange).
+RED_MID = "#FF5C5C"
 RED_GLOW = "#D63A3A"
 RED_EDGE = "#EF5A5A"
 RED_PALETTE = (RED_CORE, RED_MID, RED_GLOW)
@@ -732,6 +737,20 @@ MAX_NET_RADIUS = (config.frame_width - max(_lap_code_span(lines) for lines in CO
 NODE_RADIUS = 0.11
 NET_RADIUS_PACKING_K = 1.3
 
+# How much closer to the frame edge a node's *center* is allowed to sit
+# than the raw screen boundary would otherwise permit -- large nets were
+# packing nodes right out to cloud_radius/radius_y with nothing held
+# back for the node's own visible footprint beyond its bare center
+# point, so a node sampled right at that boundary had its real glow
+# (see add_soft_bloom's own widest span_mult=6.5 layer -- the number
+# mirrored here) bleeding past the frame edge, or the boundary itself
+# picked so tight two adjacent nets' nodes could end up nearly touching.
+# Subtracted from MAX_NET_RADIUS/MAX_NET_RADIUS_Y wherever cloud_radius/
+# radius_y actually get capped (see _stage below) rather than baked into
+# either constant directly, so each keeps meaning exactly what its own
+# name says: the raw geometric limit, not that limit minus a margin.
+NODE_EDGE_MARGIN = 6.5 * NODE_RADIUS
+
 
 def net_radius(n_nodes, spacing_mult=3.0):
     """The radius net_radius() nodes need at spacing_mult*NODE_RADIUS
@@ -758,23 +777,25 @@ def net_radius(n_nodes, spacing_mult=3.0):
 # frame_width, see above) -- frame_height=8.0 leaves far more headroom
 # (radius up to 4.0) than any STAGES net actually uses. radius_y lets the
 # later, already horizontally-capped stages stretch into that unused
-# vertical room instead of staying circular and leaving it empty -- kept
-# a bit under frame_height/2 (not all the way to 4.0) so a stretched net
-# never quite touches the top/bottom edge. Left at None (circular, same
-# as cloud_radius) for the earlier stages, which aren't at the horizontal
-# cap yet and don't need it.
-MAX_NET_RADIUS_Y = 3.7
+# vertical room instead of staying circular and leaving it empty. The
+# raw geometric limit (frame_height/2), not "a bit under" it -- NODE_
+# EDGE_MARGIN (see _stage below, where this actually gets used) is what
+# keeps a stretched net's own nodes, glow included, from reaching the
+# top/bottom edge, not a margin baked into this constant itself. Left at
+# None (circular, same as cloud_radius) for the earlier stages, which
+# aren't at the horizontal cap yet and don't need it.
+MAX_NET_RADIUS_Y = config.frame_height / 2
 
 
 def _stage(n_nodes, spacing_mult, k_neighbors, seed, radius_y=None):
     return dict(
         n_nodes=n_nodes,
-        cloud_radius=min(net_radius(n_nodes, spacing_mult), MAX_NET_RADIUS),
+        cloud_radius=min(net_radius(n_nodes, spacing_mult), MAX_NET_RADIUS - NODE_EDGE_MARGIN),
         k_neighbors=k_neighbors,
         node_radius=NODE_RADIUS,
         seed=seed,
         spacing_mult=spacing_mult,
-        radius_y=min(radius_y, MAX_NET_RADIUS_Y) if radius_y is not None else None,
+        radius_y=min(radius_y, MAX_NET_RADIUS_Y - NODE_EDGE_MARGIN) if radius_y is not None else None,
     )
 
 
@@ -804,7 +825,7 @@ INTRO_END_STAGE = dict(n_nodes=10, cloud_radius=1.17, k_neighbors=2, node_radius
 # in the frame meant to contain it.
 #
 # Shaped as a leftward-opening "sideways parabola" (see sample_cloud's
-# shape="parabola") rather than a circle/ellipse like every STAGES net --
+# shape="parabola") rather than the squircle every STAGES net uses --
 # reaching its full horizontal depth exactly at the arrow's own height
 # (y=0) and sweeping back in above and below that as |y| grows, so the
 # curve's two arms read as closing around/enveloping the arrow's own tip
@@ -856,6 +877,17 @@ FINAL_STAGE_Y_MAX = 4.6
 # curve's arms clear the arrow's own polygon everywhere the arrow actually
 # occupies space, not just at y=0 exactly.
 PARABOLA_WRAP_FRAC = 0.6 / FINAL_STAGE_X_MAX
+
+# The exponent in sample_cloud's own shape="squircle" rejection test,
+# |x|^SQUIRCLE_EXPONENT + |y|^SQUIRCLE_EXPONENT > 1 -- 2 is exactly a
+# circle/ellipse (a true superellipse at that exponent), and climbing
+# past it bulges the boundary out toward the corners of the unit square,
+# rounding off rather than snapping straight -- 4 is the traditional
+# "squircle" and already reads as a clearly rounded square rather than a
+# stretched circle even at the STAGES nets' own vertical stretch
+# (radius_y well under radius for the biggest ones).
+SQUIRCLE_EXPONENT = 4
+
 FINAL_STAGE = dict(
     n_nodes=432,
     cloud_radius=FINAL_STAGE_X_MAX,
@@ -1253,15 +1285,27 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
         # expanding ring entirely -- this render pass wants pings to read
         # as "the node flashes," not the ring's own separate growth/fade.
         #
-        # No lock/gating here otherwise -- a ring can spawn at literally
-        # any point in this net's life, including mid-slide or mid-
-        # FadeOut, without risk (see ring_holder's own comment in
+        # No lock/gating here otherwise for an *active* net -- a ring can
+        # spawn at literally any point in its life, including mid-slide
+        # or mid-FadeOut, without risk (see ring_holder's own comment in
         # build_net for why: it's never a family member of anything a
         # Scene animation targets, so adding to it is never the kind of
         # family-size change that crashes manim mid-interpolation).
-        # Pings keep firing (and rings keep appearing) exactly the same
-        # whether or not the net they belong to happens to be moving.
-        if not SIMPLE_STYLE:
+        #
+        # retired (see retire_pings) is the one exception: once a net is
+        # retired, its own ring_holder becomes the direct target of a
+        # FadeOut in that same closing self.play() (to fade away
+        # whatever rings retire_pings froze), and *that* animation's own
+        # family-size assumptions would be violated by a brand new ring
+        # arriving mid-interpolation over it -- confirmed directly
+        # against an actual render ("zip() argument 2 is shorter than
+        # argument 1"), from a hop that was already queued before
+        # retirement firing normally, same as retire_pings' own docstring
+        # says it should, and adding its ring right in the middle of
+        # that FadeOut. The flash queues regardless (see below) --
+        # retirement only ever withholds the ring, which is the one
+        # piece actually unsafe to add once retired.
+        if not SIMPLE_STYLE and not state["retired"]:
             ring, ring_tick = spawn_pulse_ring(node_list[idx], core_color)
             extras.ring_holder.add(ring)
             if DEBUG_PULSE:
@@ -1302,8 +1346,13 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
     # reason. elapsed/ticked_through drive the scheduler's own dt
     # subdivision (see scheduler below) -- kept here, alongside the rest
     # of this net's mutable state, so they persist across every separate
-    # real-frame call rather than resetting each time.
-    state = {"flash_queue": [], "active_rings": [], "elapsed": 0.0, "ticked_through": 0.0}
+    # real-frame call rather than resetting each time. retired starts
+    # False -- retire_pings (see below) sets it True for a net that's
+    # about to fade out for good, so no *new* chain starts once its
+    # queue drains, while whatever's already queued/mid-flight (a hop
+    # already committed, a flash already lit, a ring already expanding)
+    # still finishes out naturally rather than cutting off mid-beat.
+    state = {"flash_queue": [], "active_rings": [], "elapsed": 0.0, "ticked_through": 0.0, "retired": False}
     debug_tag = id(nodes_group) % 1000
     debug_clock = {"t": 0.0, "n": 0}
 
@@ -1331,29 +1380,44 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
         # to reason about even though ring_holder itself (see build_net's
         # own comment) is never a family member of any Animation that
         # could otherwise ghost-tick it.
-        still_active = []
-        for ring, ring_tick, finished in state["active_rings"]:
-            was_finished = finished
-            finished = ring_tick(dt) or finished
-            if DEBUG_PULSE and finished and not was_finished:
-                print(
-                    f"RING tag={debug_tag} FINISH id={getattr(ring, '_debug_id', '?')} "
-                    f"clock={debug_clock['t']:.4f} "
-                    f"opacity={ring.stroke_opacity if hasattr(ring, 'stroke_opacity') else '?'} "
-                    f"radius={ring.width/2:.4f}",
-                    flush=True,
-                )
-            if finished:
-                if DEBUG_PULSE:
+        #
+        # Skipped once retired (see retire_pings) -- a retired net is
+        # moments from its own closing FadeOut, and that FadeOut targets
+        # ring_holder directly (see every retire_pings call site) to fade
+        # whatever rings are still around right along with the rest of
+        # the net. Left ticking, this loop would keep re-asserting each
+        # ring's own tick()-computed opacity every single frame, fighting
+        # the FadeOut for control of that same value -- confirmed
+        # directly against an actual render: nets fade out completely
+        # while their own rings stay fully visible, floating with
+        # nothing left to anchor them. Freezing here instead leaves each
+        # ring exactly as it looked the instant retirement was called,
+        # for FadeOut(ring_holder) to fade uniformly from there with
+        # nothing else touching its opacity in the meantime.
+        if not state["retired"]:
+            still_active = []
+            for ring, ring_tick, finished in state["active_rings"]:
+                was_finished = finished
+                finished = ring_tick(dt) or finished
+                if DEBUG_PULSE and finished and not was_finished:
                     print(
-                        f"RING tag={debug_tag} REMOVE id={getattr(ring, '_debug_id', '?')} "
-                        f"clock={debug_clock['t']:.4f}",
+                        f"RING tag={debug_tag} FINISH id={getattr(ring, '_debug_id', '?')} "
+                        f"clock={debug_clock['t']:.4f} "
+                        f"opacity={ring.stroke_opacity if hasattr(ring, 'stroke_opacity') else '?'} "
+                        f"radius={ring.width/2:.4f}",
                         flush=True,
                     )
-                extras.ring_holder.remove(ring)
-            else:
-                still_active.append([ring, ring_tick, finished])
-        state["active_rings"] = still_active
+                if finished:
+                    if DEBUG_PULSE:
+                        print(
+                            f"RING tag={debug_tag} REMOVE id={getattr(ring, '_debug_id', '?')} "
+                            f"clock={debug_clock['t']:.4f}",
+                            flush=True,
+                        )
+                    extras.ring_holder.remove(ring)
+                else:
+                    still_active.append([ring, ring_tick, finished])
+            state["active_rings"] = still_active
 
         pending_flash = []
         for delay, idx in state["flash_queue"]:
@@ -1385,6 +1449,14 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
                 continue
             chain["cooldown"] -= dt
             if chain["cooldown"] > 0:
+                continue
+            if state["retired"]:
+                # This net is fading out for good (see retire_pings) --
+                # this chain's own queue already fully drained (the check
+                # above), so no hop from it is still in flight; simply
+                # never starting a new one is enough to let this net go
+                # quiet on its own within a beat, without cutting off
+                # anything already committed elsewhere.
                 continue
 
             length = random.randint(3, 5)
@@ -1477,21 +1549,29 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
     driver.add_updater(scheduler)
     extras.pulse_driver = driver
 
-    # ring_holder (see build_net) is a family member of next_net for
-    # movement/fade purposes, but next_net as a *whole* is never itself
-    # targeted by any animation until the slide/FadeOut much later --
-    # grow_in only ever targets its individual pieces (glow, extras,
-    # edges, nodes) directly, and manim only adds a mobject to the
-    # scene's own render/update list when it's self.add()-ed or is the
-    # direct target of a running Animation. Left implicit, ring_holder
-    # would never actually become part of the scene at all: any ring
-    # added to it would exist as a live Python object with a running
-    # updater, yet never be drawn and never receive a single per-frame
-    # update -- rings that fire but are never seen (confirmed against an
-    # actual render: zero rings visible anywhere, despite fire() calling
+    # ring_holder (see build_net) is never itself the direct target of
+    # any animation, and manim only adds a mobject to the scene's own
+    # render/update list when it's self.add()-ed or is the direct target
+    # of a running Animation. Left implicit, ring_holder would never
+    # actually become part of the scene at all: any ring added to it
+    # would exist as a live Python object with a running updater, yet
+    # never be drawn and never receive a single per-frame update --
+    # rings that fire but are never seen (confirmed against an actual
+    # render: zero rings visible anywhere, despite fire() calling
     # spawn_pulse_ring exactly as expected). Added directly here instead
     # of relying on some later animation to sweep it in.
     scene.add(extras.ring_holder)
+
+    # Stashed on extras (same reasoning as pulse_driver above) so a
+    # caller about to fade this net out for good can reach it without
+    # this closure's own state threaded through as a parameter -- see
+    # retire_pings' own docstring for what it actually does and why it's
+    # a deliberate, separate opt-in rather than something stop_effects
+    # does automatically for every caller.
+    def retire_pings():
+        state["retired"] = True
+
+    extras.retire_pings = retire_pings
 
 
 def stop_effects(extras):
@@ -1506,7 +1586,10 @@ def stop_effects(extras):
     family member of the slide/FadeOut Animation this is guarding around
     (see build_net's own comment on why), so pings keep firing -- new
     rings included -- exactly the same whether or not this net happens
-    to be moving right now.
+    to be moving right now. A net about to disappear for good rather
+    than just reposition still wants those *new* pings stopped, just not
+    via this function -- see retire_pings, called separately alongside
+    this one at exactly those call sites.
 
     Bloom-disc tracking is what actually needs freezing here, for an
     older, unrelated reason: .suspend_updating() turned out not to be
@@ -1527,6 +1610,39 @@ def resume_effects(extras):
     chains isn't called again."""
     for disc in extras:
         disc.add_updater(lambda mob: mob.move_to(mob.tracked_node.get_center()))
+
+
+def retire_pings(extras):
+    """Stop this net from starting any *new* pulse chains, and freeze
+    every ring it currently has in flight right where it is -- call
+    right before a FadeOut that removes this net for good (never a
+    slide that just repositions it: that net is staying, so its pings
+    should keep firing exactly as normal). Deliberately separate from
+    stop_effects, which every caller uses unconditionally regardless of
+    which of those two cases it is -- this is opt-in, only for the "gone
+    for good" one.
+
+    Pair this with a FadeOut(extras.ring_holder) in that same closing
+    self.play() -- retire_pings only freezes each ring's appearance, it
+    doesn't fade anything on its own; without that FadeOut, whatever
+    rings were still around when this was called would just sit there,
+    frozen, indefinitely. With it, they fade smoothly along with the
+    rest of the net instead of continuing to independently animate (or
+    worse, sitting at full opacity) while everything else around them
+    disappears -- confirmed directly against an actual render: nets
+    fading out completely while their own rings stayed fully visible,
+    floating with nothing left to anchor them, is exactly what freezing
+    (rather than leaving the scheduler still ticking them, fighting
+    that same FadeOut for control of their opacity) fixes.
+
+    New chains stop immediately. A hop that was already queued before
+    this was called still fires its flash exactly once more, same as
+    always, but never a new ring (see fire()'s own comment) -- one would
+    otherwise still be free to arrive mid-FadeOut over that same
+    ring_holder some time after this call, right when this whole
+    mechanism is trying to guarantee its family stays fixed."""
+    if hasattr(extras, "retire_pings"):
+        extras.retire_pings()
 
 
 def make_node(pos, radius, palette):
@@ -1633,23 +1749,40 @@ def make_glow_blob(local_points, edge_indices, cloud_radius, node_radius):
 MAX_SAMPLE_TRIES = 20000
 
 
-def sample_cloud(n, radius, node_radius, seed, min_dist_factor=0.32, spacing_mult=3.0, radius_y=None, shape="ellipse"):
-    """n points scattered inside a disc of the given radius (or an ellipse,
-    if radius_y differs from radius -- see STAGES' vertical stretch for
-    later stages), rejecting anything too close to a point already placed
-    -- rough blue-noise spacing, so nodes read as an organic cluster
-    rather than a grid. Sampled uniformly in a unit disc, then the disc
-    itself is stretched to (radius, radius_y) rather than sampled directly
-    in ellipse coordinates -- simple, and the min_dist rejection below
-    still operates on genuine post-stretch Euclidean distance, so spacing
-    stays correct regardless of aspect ratio. Whatever that blue-noise
-    spacing works out to, it's never allowed below spacing_mult*node_radius
-    -- at the default spacing_mult=3.0, two touching node circles
-    (2*node_radius) plus a full extra node_radius of clear margin between
-    them, so nodes at this size can never actually overlap, even for the
-    sparsest/smallest-radius stages where the proportional spacing alone
-    would allow it. Callers packing a fixed on-screen radius tighter to
-    fit more nodes (see STAGES) pass a smaller spacing_mult instead.
+def sample_cloud(
+    n, radius, node_radius, seed, min_dist_factor=0.32, spacing_mult=3.0, radius_y=None, shape="squircle"
+):
+    """n points scattered inside a region of the given radius (or a
+    stretched one, if radius_y differs from radius -- see STAGES'
+    vertical stretch for later stages), rejecting anything too close to
+    a point already placed -- rough blue-noise spacing, so nodes read as
+    an organic cluster rather than a grid. Sampled uniformly in a unit
+    square and rejected against the unit shape's own boundary, then that
+    unit shape is stretched to (radius, radius_y) rather than sampled
+    directly in stretched coordinates -- simple, and the min_dist
+    rejection below still operates on genuine post-stretch Euclidean
+    distance, so spacing stays correct regardless of aspect ratio.
+    Whatever that blue-noise spacing works out to, it's never allowed
+    below spacing_mult*node_radius -- at the default spacing_mult=3.0,
+    two touching node circles (2*node_radius) plus a full extra
+    node_radius of clear margin between them, so nodes at this size can
+    never actually overlap, even for the sparsest/smallest-radius stages
+    where the proportional spacing alone would allow it. Callers packing
+    a fixed on-screen radius tighter to fit more nodes (see STAGES) pass
+    a smaller spacing_mult instead.
+
+    shape="squircle" (the default -- every STAGES net and both intro
+    nets use it) rejects |x|^SQUIRCLE_EXPONENT + |y|^SQUIRCLE_EXPONENT >
+    1 rather than plain x^2 + y^2 > 1 -- the same superellipse family a
+    true circle/ellipse (exponent 2) belongs to, just with a higher
+    exponent that pushes the boundary out toward a rounded square instead
+    (see SQUIRCLE_EXPONENT's own comment for why 2 read as an
+    unmistakably squished circle once a net's radius_y stretched it
+    noticeably away from radius, in a way a rounder-cornered rectangle
+    doesn't). Nodes fill *more* of the unit square with the higher
+    exponent (more area lands inside the boundary before stretching), so
+    a squircle-shaped net of a given radius holds more nodes at the same
+    spacing than the same radius would as a true ellipse.
 
     shape="parabola" (only FINAL_STAGE uses this) instead bounds the
     region on its right/far side with a plain flat cutoff at x=radius --
@@ -1683,7 +1816,7 @@ def sample_cloud(n, radius, node_radius, seed, min_dist_factor=0.32, spacing_mul
             x = rng.uniform(x_left, 1)
         else:
             x, y = rng.uniform(-1, 1), rng.uniform(-1, 1)
-            if x * x + y * y > 1:
+            if abs(x) ** SQUIRCLE_EXPONENT + abs(y) ** SQUIRCLE_EXPONENT > 1:
                 continue
         candidate = np.array([x * radius, y * radius_y, 0])
         if all(np.linalg.norm(candidate - p) > min_dist for p in points):
@@ -1982,7 +2115,7 @@ def build_net(
     edge_color,
     spacing_mult=3.0,
     radius_y=None,
-    shape="ellipse",
+    shape="squircle",
 ):
     # min_dist_factor forced to 0 (below sample_cloud's own default) --
     # its radius*min_dist_factor term scales *with* radius, so at the
@@ -2397,12 +2530,32 @@ class RecursiveSelfImprovement(ThreeDScene):
         # block, and the backdrop stays put throughout -- so this reads
         # as the scene's pieces settling away, not the whole picture
         # (background glow included) dimming to black.
-        # stop_effects here only freezes bloom-disc tracking (see its own
-        # docstring) -- flash/scheduler/rings keep running completely
-        # normally right through the FadeOut, so both nets keep pinging,
-        # new rings included, as they fade.
+        # stop_effects freezes bloom-disc tracking; retire_pings stops
+        # each net from starting any *new* chain and freezes whatever
+        # rings it still has in flight (see its own docstring) -- both
+        # nets are gone for good here, not just repositioning, so both
+        # get it, and both their ring_holders are included in the
+        # FadeOut below so those frozen rings fade smoothly away with
+        # everything else instead of being left behind, fully visible.
         stop_effects(extras0)
         stop_effects(extras1)
+        retire_pings(extras0)
+        retire_pings(extras1)
+        # ring_holder FadeOuts run as plain siblings of the LaggedStart,
+        # not nested inside it -- inside, being last in the list, they'd
+        # only start staggered near the *end* of the sequence (lag_ratio
+        # delays each item's own start relative to the last), fading
+        # only across whatever sliver of run_time was left by then. As
+        # siblings they get this same self.play's run_time directly
+        # (Scene.compile_animations applies a shared run_time to every
+        # top-level animation uniformly -- see RecursiveSelfImprovement.
+        # play's own comment on INSTANT for the same mechanism), so any
+        # ring still around fades across the *entire* span of the
+        # sequence instead of being crammed into the tail end of it --
+        # confirmed directly against an actual render: nested inside,
+        # the rest of a net had already faded to nothing well before its
+        # own rings even started fading, reading as leftover rings
+        # floating with nothing left to anchor them.
         self.play(
             LaggedStart(
                 FadeOut(net0),
@@ -2413,6 +2566,8 @@ class RecursiveSelfImprovement(ThreeDScene):
                 FadeOut(right_arrow),
                 lag_ratio=0.2,
             ),
+            FadeOut(extras0.ring_holder),
+            FadeOut(extras1.ring_holder),
             run_time=max(1.2 * m, 0.6),
         )
 
@@ -2562,16 +2717,20 @@ class RecursiveSelfImprovement(ThreeDScene):
                 )
                 self.hold(0.5 * m)
 
-                # next_net is about to slide -- stop_effects here only
-                # freezes its bloom-disc tracking (see stop_effects' own
-                # docstring); flash/scheduler/rings keep pinging, new
-                # rings included, completely unaffected right through
-                # the slide.
+                # next_net is only repositioning, not disappearing -- no
+                # retire_pings for it, so it keeps pinging, new rings
+                # included, completely unaffected right through the
+                # slide (stop_effects here only freezes its bloom-disc
+                # tracking, see stop_effects' own docstring).
                 stop_effects(next_extras)
-                # current_net is about to fade out for good -- same
-                # reasoning, its own pings (new rings included) keep
-                # firing right up until it's gone.
+                # current_net, on the other hand, is fading out for
+                # good -- retire_pings stops it from starting any *new*
+                # chain and freezes whatever rings it still has in
+                # flight (its ring_holder is included in the FadeOut
+                # below, so those frozen rings fade away with it instead
+                # of being left behind, fully visible).
                 stop_effects(current_extras)
+                retire_pings(current_extras)
                 # The lap right after this one is the final, deliberately-
                 # overflowing net -- centering the composition around it
                 # would try to drag everything sideways to "balance" a net
@@ -2596,6 +2755,7 @@ class RecursiveSelfImprovement(ThreeDScene):
                     FadeOut(brace),
                     FadeOut(left_arrow),
                     FadeOut(right_arrow),
+                    FadeOut(current_extras.ring_holder),
                     next_net.animate.shift(np.array([slide_shift, 0, 0])),
                     run_time=max(1.0 * m, 0.45),
                 )
@@ -2680,11 +2840,13 @@ class RecursiveSelfImprovement(ThreeDScene):
             # The last flat net and its code fade away while the icosahedron
             # is brought to center -- then the camera tilts to reveal it was
             # never flat to begin with, and it spins as the closing shot.
-            # stop_effects here only freezes bloom-disc tracking (see its
-            # own docstring) -- flash/scheduler/rings keep pinging, new
-            # rings included, completely unaffected right through the
-            # FadeOut.
+            # current_net is gone for good here -- retire_pings winds its
+            # pinging down and freezes whatever rings it still has in
+            # flight, ready for the FadeOut below to fade them away
+            # along with everything else instead of leaving them behind,
+            # fully visible.
             stop_effects(current_extras)
+            retire_pings(current_extras)
             ico_group = VGroup(ico_glow, ico_vertices, ico_edges)
             self.play(
                 FadeOut(current_net),
@@ -2693,6 +2855,7 @@ class RecursiveSelfImprovement(ThreeDScene):
                 FadeOut(left_arrow),
                 FadeOut(right_arrow),
                 FadeOut(backdrop),
+                FadeOut(current_extras.ring_holder),
                 ico_group.animate.shift(np.array([-ico_center_x, 0, 0])),
                 run_time=1.2,
             )
@@ -2735,13 +2898,31 @@ class RecursiveSelfImprovement(ThreeDScene):
                 # synchronized block, and the backdrop stays put
                 # throughout -- so this reads as the scene's pieces
                 # settling away, not the whole picture (background glow
-                # included) dimming to black. stop_effects here only
-                # freezes bloom-disc tracking (see its own docstring) --
-                # both nets' flash/scheduler/rings keep pinging, new
-                # rings included, completely unaffected right through
-                # the FadeOut.
+                # included) dimming to black. Both nets are gone for
+                # good here, so both get retire_pings alongside
+                # stop_effects -- pinging winds down and any rings still
+                # in flight freeze, ready for their own ring_holders to
+                # fade them away along with everything else instead of
+                # leaving them behind, fully visible.
+                #
+                # ring_holder FadeOuts run as plain siblings of the
+                # LaggedStart, not nested inside it -- inside, being
+                # last in the list, they'd only start staggered near the
+                # *end* of the sequence (lag_ratio delays each item's own
+                # start relative to the last), fading only across
+                # whatever sliver of run_time was left by then. As
+                # siblings they get this self.play's run_time directly,
+                # so any ring still around fades across the entire span
+                # of the sequence instead of the tail end of it --
+                # confirmed directly against an actual render: nested
+                # inside, the rest of a net had already faded to nothing
+                # well before its own rings even started fading, reading
+                # as leftover rings floating with nothing left to anchor
+                # them.
                 stop_effects(current_extras)
                 stop_effects(final_extras)
+                retire_pings(current_extras)
+                retire_pings(final_extras)
                 self.play(
                     LaggedStart(
                         FadeOut(current_net),
@@ -2752,5 +2933,7 @@ class RecursiveSelfImprovement(ThreeDScene):
                         FadeOut(final_net),
                         lag_ratio=0.2,
                     ),
+                    FadeOut(current_extras.ring_holder),
+                    FadeOut(final_extras.ring_holder),
                     run_time=1.6,
                 )
