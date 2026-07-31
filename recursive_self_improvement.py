@@ -1253,21 +1253,15 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
         # expanding ring entirely -- this render pass wants pings to read
         # as "the node flashes," not the ring's own separate growth/fade.
         #
-        # rings_locked (see lock_rings/unlock_rings below) withholds just
-        # *new* rings -- the flash still fires immediately either way --
-        # for as long as ring_holder is a family member of whatever's
-        # directly being targeted by a currently-running whole-net
-        # animation (the slide, or this net's own final FadeOut):
-        # ring_holder itself is never such a target (see build_net's own
-        # comment on why it's a plain sibling of extras), so spawning
-        # mid-grow-in is always safe, but a ring *arriving* mid-slide or
-        # mid-FadeOut would change the size of the very family that
-        # animation is actively interpolating over, and crash outright
-        # ("zip() argument 2 is shorter than argument 1", confirmed
-        # against an actual render). Already-spawned rings keep animating
-        # regardless (see the scheduler's own active_rings loop below) --
-        # only spawning a *new* one is what's actually unsafe here.
-        if not SIMPLE_STYLE and not state["rings_locked"]:
+        # No lock/gating here otherwise -- a ring can spawn at literally
+        # any point in this net's life, including mid-slide or mid-
+        # FadeOut, without risk (see ring_holder's own comment in
+        # build_net for why: it's never a family member of anything a
+        # Scene animation targets, so adding to it is never the kind of
+        # family-size change that crashes manim mid-interpolation).
+        # Pings keep firing (and rings keep appearing) exactly the same
+        # whether or not the net they belong to happens to be moving.
+        if not SIMPLE_STYLE:
             ring, ring_tick = spawn_pulse_ring(node_list[idx], core_color)
             extras.ring_holder.add(ring)
             if DEBUG_PULSE:
@@ -1299,20 +1293,17 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
     # flash_queue holds the same [time_remaining, node_index] shape as a
     # chain's own queue, for flashes waiting on FLASH_DELAY -- shared
     # across every chain since a flash is a per-node effect, not a
-    # per-chain one. rings_locked starts False -- grow-in doesn't need it
-    # (see fire()'s own comment) -- stop_effects/resume_effects (see
-    # below) toggle it around the one remaining unsafe window, a
-    # whole-net animation. active_rings holds [ring, tick, finished] for
-    # every ring still being tracked -- finished flips to True once
-    # tick() reports the ring is done growing/fading, but it stays in
-    # this list (ticked no further) until it's actually safe to remove
-    # from ring_holder (see the scheduler's own active_rings loop below).
-    # Both are also shared across every chain for the same reason.
-    # elapsed/ticked_through drive the scheduler's own dt subdivision (see
-    # scheduler below) -- kept here, alongside the rest of this net's
-    # mutable state, so they persist across every separate real-frame call
-    # rather than resetting each time.
-    state = {"flash_queue": [], "rings_locked": False, "active_rings": [], "elapsed": 0.0, "ticked_through": 0.0}
+    # per-chain one. active_rings holds [ring, tick, finished] for every
+    # ring still being tracked -- finished flips to True once tick()
+    # reports the ring is done growing/fading, at which point the
+    # scheduler's own active_rings loop below removes it from ring_holder
+    # immediately (safe at any time -- see ring_holder's own comment in
+    # build_net). Both are also shared across every chain for the same
+    # reason. elapsed/ticked_through drive the scheduler's own dt
+    # subdivision (see scheduler below) -- kept here, alongside the rest
+    # of this net's mutable state, so they persist across every separate
+    # real-frame call rather than resetting each time.
+    state = {"flash_queue": [], "active_rings": [], "elapsed": 0.0, "ticked_through": 0.0}
     debug_tag = id(nodes_group) % 1000
     debug_clock = {"t": 0.0, "n": 0}
 
@@ -1333,35 +1324,13 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
             node_tick(dt)
 
         # Every in-flight ring's own tick (see spawn_pulse_ring) lives
-        # here too, for the identical reason -- ring_holder is a family
-        # member of whatever whole-net Animation might be running (the
-        # slide, a FadeOut), so a ring with its own add_updater would get
-        # ghost-ticked an extra time per frame for as long as that
-        # animation runs, roughly doubling its own growth/fade speed
-        # (confirmed directly: exactly the "pings sped up while the
-        # other net moves" symptom).
-        #
-        # Kept ticking every frame even after it finishes (tick() at
-        # progress>=1 just keeps re-asserting the same fully-faded,
-        # max-radius state -- cheap and idempotent) rather than left
-        # alone once finished, which an earlier version of this did.
-        # That let a *different* reset sneak in underneath: the very
-        # Animation this ring's net is riding along in (the slide, or a
-        # FadeOut) calls Animation.finish() on itself once done, which
-        # forcibly resets every family member -- this ring included --
-        # back to a snapshot taken when that animation *began*, i.e.
-        # whatever partial radius/opacity the ring had way back then,
-        # not however far it had actually faded by the time it finished.
-        # With no further tick() to immediately re-correct that (since
-        # this ring was already marked finished and skipped), the ring
-        # sat there rendering that stale, partially-visible snapshot for
-        # however long it remained locked, then vanished all at once the
-        # moment it was finally removed -- confirmed directly against an
-        # instrumented log: rings whose own data already said
-        # opacity=0.0 at FINISH time were still being reset visually and
-        # only really disappearing, in a batch, once unlocked. Ticking
-        # unconditionally means that reset gets overwritten again on the
-        # very next frame, same as it would for a still-growing ring.
+        # here too, driven unconditionally every call same as the flash
+        # ticks above, rather than each ring carrying its own add_updater
+        # -- keeps ring growth/fade timing driven off exactly the same
+        # per-frame dt as everything else on this net, with nothing extra
+        # to reason about even though ring_holder itself (see build_net's
+        # own comment) is never a family member of any Animation that
+        # could otherwise ghost-tick it.
         still_active = []
         for ring, ring_tick, finished in state["active_rings"]:
             was_finished = finished
@@ -1369,12 +1338,12 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
             if DEBUG_PULSE and finished and not was_finished:
                 print(
                     f"RING tag={debug_tag} FINISH id={getattr(ring, '_debug_id', '?')} "
-                    f"clock={debug_clock['t']:.4f} locked={state['rings_locked']} "
+                    f"clock={debug_clock['t']:.4f} "
                     f"opacity={ring.stroke_opacity if hasattr(ring, 'stroke_opacity') else '?'} "
                     f"radius={ring.width/2:.4f}",
                     flush=True,
                 )
-            if finished and not state["rings_locked"]:
+            if finished:
                 if DEBUG_PULSE:
                     print(
                         f"RING tag={debug_tag} REMOVE id={getattr(ring, '_debug_id', '?')} "
@@ -1476,8 +1445,8 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
         # the "moves node to node at ~1/sec instead of ~0.2s" symptom.
         #
         # Fixed by tracking elapsed/ticked_through on this net's own
-        # persistent `state` (set up alongside flash_queue/rings_locked/
-        # active_rings above) instead of a call-local variable: every call
+        # persistent `state` (set up alongside flash_queue/active_rings
+        # above) instead of a call-local variable: every call
         # adds its own dt to the running total, and the loop below emits
         # exactly one step-sized tick_one_frame(step) for every full step
         # boundary that total has newly crossed since the last call --
@@ -1524,120 +1493,40 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
     # of relying on some later animation to sweep it in.
     scene.add(extras.ring_holder)
 
-    # Stashed on extras (same reasoning as pulse_driver above) so
-    # stop_effects/resume_effects can toggle rings_locked around a
-    # whole-net animation without needing this closure's own state
-    # threaded through as a parameter.
-    def lock_rings():
-        state["rings_locked"] = True
-
-    def unlock_rings():
-        # Flushed immediately, synchronously, right here -- rather than
-        # just clearing the lock and letting this net's own driver
-        # correct things whenever its next real-frame tick happens to
-        # land -- to close a one-frame gap that reads as "a bunch of
-        # rings appear out of nowhere and then disappear" right as a net
-        # settles into place after a slide.
-        #
-        # A slide is `next_net.animate.shift(...)` -- a Transform-family
-        # animation over next_net's *entire* family, ring_holder and its
-        # locked rings included. Transform re-interpolates every family
-        # member every frame it's running (Scene.update_to_time calls
-        # animation.interpolate(alpha) before the scene's own
-        # per-mobject updater pass, so this net's own driver tick -- part
-        # of that later pass -- still gets the last, correct word on
-        # every one of those frames), but manim also calls
-        # animation.finish() -> interpolate(1) once more right as the
-        # slide's self.play() call itself returns, this time with no
-        # further driver tick queued up to immediately re-correct it
-        # (the next one only comes whenever the *next* self.play's own
-        # frame loop happens to reach a real per-frame update). A ring
-        # that fully faded mid-slide -- locked the whole time, so never
-        # removed -- gets reset by that stray extra interpolate() back to
-        # whatever it looked like at the *start* of the slide (a
-        # `.animate.shift()` only ever changes position between its start
-        # and target snapshots, never style, so style stays frozen at
-        # its start-of-slide snapshot for as long as nothing else
-        # touches it): bright and mid-animation again, not faded. With
-        # nothing else rendered in between, that reset is exactly what
-        # the next actual frame shows -- then this same net's next real
-        # tick (from whatever self.play comes after) sees it's finished,
-        # unlocked, and removes it outright, before that frame renders.
-        # Two consecutive frames, wrong-then-gone, is exactly the
-        # flicker being described.
-        #
-        # Ticking with dt=0 re-asserts the ring's *true* current
-        # radius/opacity (driven by this ring's own state["t"], which
-        # finish()'s reset never touched -- only the ring's manim-side
-        # geometry/style was clobbered) immediately, before any further
-        # rendering happens, and removes it outright if that leaves it
-        # finished -- so by the time a frame actually gets drawn, either
-        # is true: the ring is back to correctly reflecting its own real
-        # progress, or it's already gone. Never the stale snapshot.
-        still_active = []
-        for ring, ring_tick, finished in state["active_rings"]:
-            finished = ring_tick(0) or finished
-            if finished:
-                extras.ring_holder.remove(ring)
-            else:
-                still_active.append([ring, ring_tick, finished])
-        state["active_rings"] = still_active
-        state["rings_locked"] = False
-
-    extras.lock_rings = lock_rings
-    extras.unlock_rings = unlock_rings
-
 
 def stop_effects(extras):
-    """Freeze this net's bloom-disc tracking and lock new pulse rings --
-    call before any animation that repositions OR fades out the net as a
-    whole (the slide, or a final FadeOut). The scheduler, every node's
-    own flash, and every ring already in flight all keep running right
-    through it regardless -- all three live on add_pulse_chains' own
-    driver mobject now (see spawn_pulse_ring and its own tick, ticked
-    once per frame from the scheduler's active_rings loop) -- only *new*
-    rings are withheld here, so a stationary or fading net keeps
-    pinging, rings included, instead of visibly going quiet the moment
-    something else starts moving.
+    """Freeze this net's bloom-disc tracking -- call before any animation
+    that repositions OR fades out the net as a whole (the slide, or a
+    final FadeOut). The scheduler, every node's own flash, and every
+    pulse ring (spawning, growing, fading, and being removed once
+    finished) all keep running completely unaffected right through it --
+    all three live on add_pulse_chains' own driver mobject now (see
+    spawn_pulse_ring and its own tick, ticked once per frame from the
+    scheduler's active_rings loop), and ring_holder is never itself a
+    family member of the slide/FadeOut Animation this is guarding around
+    (see build_net's own comment on why), so pings keep firing -- new
+    rings included -- exactly the same whether or not this net happens
+    to be moving right now.
 
-    Bloom-disc tracking is cleared for an older, unrelated reason:
-    .suspend_updating() turned out not to be enough on its own -- even
-    suspended, an attached updater somehow still left a following
-    net.animate.shift() silently unable to move the mobject (proven by
-    an isolated test: identical shift, .suspend_updating() -> no
-    movement, .clear_updaters() -> moves correctly).
-
-    Rings are locked (extras.lock_rings, see add_pulse_chains) because
-    ring_holder -- unlike during grow-in, where it's never the target of
-    anything -- *is* a family member of whatever whole-net Animation is
-    about to run (the slide targets next_net, a FadeOut targets
-    current_net, both of which contain ring_holder), so a ring arriving
-    or self-removing while that animation is mid-interpolation over
-    exactly that family crashes manim outright ("zip() argument 2 is
-    shorter than argument 1", confirmed against an actual render). Only
-    the add/remove itself is unsafe, not a ring's own ongoing growth/
-    fade/move -- the scheduler's own active_rings loop keeps ticking
-    every already-spawned ring normally regardless of this lock, it just
-    defers that one remove() call until the lock lifts again (see
-    resume_effects), which for a ring already most of the way through
-    its 2s life by the time a fade/slide starts is rarely more than a
-    beat away anyway."""
+    Bloom-disc tracking is what actually needs freezing here, for an
+    older, unrelated reason: .suspend_updating() turned out not to be
+    enough on its own -- even suspended, an attached updater somehow
+    still left a following net.animate.shift() silently unable to move
+    the mobject (proven by an isolated test: identical shift,
+    .suspend_updating() -> no movement, .clear_updaters() -> moves
+    correctly)."""
     for disc in extras:
         disc.clear_updaters()
-    if hasattr(extras, "lock_rings"):
-        extras.lock_rings()
 
 
 def resume_effects(extras):
-    """Re-attach bloom-disc tracking and unlock rings again -- call right
-    after any animation that moves a net (e.g. the slide into the left
-    slot). The scheduler/flash driver was never stopped in the first
-    place (see stop_effects), so there's nothing to restart there --
-    add_pulse_chains isn't called again."""
+    """Re-attach bloom-disc tracking -- call right after any animation
+    that moves a net (e.g. the slide into the left slot). The scheduler/
+    flash/ring driver was never stopped in the first place (see
+    stop_effects), so there's nothing to restart there -- add_pulse_
+    chains isn't called again."""
     for disc in extras:
         disc.add_updater(lambda mob: mob.move_to(mob.tracked_node.get_center()))
-    if hasattr(extras, "unlock_rings"):
-        extras.unlock_rings()
 
 
 def make_node(pos, radius, palette):
@@ -2162,22 +2051,29 @@ def build_net(
         for node in nodes_list:
             add_soft_bloom(node, node_radius, palette[2], extras)
 
-    # Pulse rings (see spawn_pulse_ring) live in their own Group, a plain
-    # sibling of extras rather than a member of it -- stashed as an
-    # attribute (extras.ring_holder), not a parameter threaded through
-    # every call site, purely so add_pulse_chains/stop_effects/
-    # resume_effects can reach it without changing their own signatures.
-    # A ping that fires while this net is still growing in needs to add a
-    # ring *during* grow_in's own FadeIn(extras) call -- if that ring
-    # lived inside extras itself, changing extras' own family size while
-    # FadeIn(extras) is mid-interpolation over exactly that family crashes
-    # manim outright (confirmed against an actual render: "zip() argument
-    # 2 is shorter than argument 1"). ring_holder is never itself the
-    # target of any FadeIn/GrowFromCenter/animate call -- only ever a
-    # passenger, riding along inside the net's own Group -- so nothing is
-    # ever mid-stride over its family specifically when a ring is added
-    # or removed, regardless of what's playing on the rest of the net at
-    # that moment.
+    # Pulse rings (see spawn_pulse_ring) live in their own Group, a total
+    # sibling of both extras and net -- never nested inside either one --
+    # stashed as an attribute (extras.ring_holder), not a parameter
+    # threaded through every call site, purely so add_pulse_chains/
+    # stop_effects/resume_effects can reach it without changing their own
+    # signatures. A ping can fire at literally any point in this net's
+    # life -- mid-grow-in, mid-slide, mid-FadeOut -- and needs to add (or
+    # later remove) a ring right then, not whenever it's next safe to.
+    # ring_holder never being a family member of anything a Scene
+    # animation targets (not extras, not the net Group below) is what
+    # makes that safe: FadeIn(extras)/FadeOut(net)/net.animate.shift()
+    # all walk a fixed family captured at that animation's own begin() --
+    # changing a family's *size* while an animation is mid-interpolation
+    # over exactly that family crashes manim outright (confirmed against
+    # an actual render: "zip() argument 2 is shorter than argument 1")
+    # -- and ring_holder simply never being part of any such family means
+    # adding/removing a ring can never be that change, regardless of
+    # what's simultaneously playing on the rest of the net. A ring's own
+    # position still tracks its node correctly throughout any of that
+    # (see spawn_pulse_ring's own tick -- move_to(node.get_center()) runs
+    # every frame off the node's own live, currently-animating position,
+    # not off any position ring_holder itself would have inherited by
+    # being a passenger in the net's own Group).
     ring_holder = Group()
     extras.ring_holder = ring_holder
 
@@ -2201,10 +2097,14 @@ def build_net(
 
     # Group rather than VGroup: it needs to hold ImageMobjects (glow,
     # extras) alongside the VMobject-based edges/nodes, which VGroup
-    # rejects. A member of net itself, not tracked separately, so the
-    # existing FadeOut/.animate.shift() calls on the whole net move and
-    # fade it right along with everything else without any extra code.
-    net = Group(glow, edges_group, extras, nodes_group, ring_holder)
+    # rejects. ring_holder deliberately left out (see its own comment
+    # above) -- existing FadeOut/.animate.shift() calls on the whole net
+    # move and fade everything else together without any extra code, but
+    # rings track their own node's live position directly (see
+    # spawn_pulse_ring's own tick) and fade out on their own schedule
+    # regardless of whatever the net itself is doing, including once the
+    # net's own FadeOut has already finished and removed it.
+    net = Group(glow, edges_group, extras, nodes_group)
     return net, nodes_group, edges_group, glow, extras
 
 
@@ -2497,10 +2397,10 @@ class RecursiveSelfImprovement(ThreeDScene):
         # block, and the backdrop stays put throughout -- so this reads
         # as the scene's pieces settling away, not the whole picture
         # (background glow included) dimming to black.
-        # Both nets' new rings are locked first (see stop_effects' own
-        # docstring) -- their flash/scheduler and any ring already in
-        # flight all keep running right through the FadeOut, so both
-        # keep pinging as they fade.
+        # stop_effects here only freezes bloom-disc tracking (see its own
+        # docstring) -- flash/scheduler/rings keep running completely
+        # normally right through the FadeOut, so both nets keep pinging,
+        # new rings included, as they fade.
         stop_effects(extras0)
         stop_effects(extras1)
         self.play(
@@ -2662,22 +2562,15 @@ class RecursiveSelfImprovement(ThreeDScene):
                 )
                 self.hold(0.5 * m)
 
-                # next_extras' *new* rings are locked here -- next_net is
-                # about to slide, and a ring spawning mid-slide would
-                # change ring_holder's family size while the slide is
-                # mid-interpolation over it and crash (see stop_effects'
-                # own docstring). Its flash/scheduler and any ring already
-                # in flight keep running right through the slide
-                # unchanged -- resume_effects lifts the lock again once
-                # it's safe.
+                # next_net is about to slide -- stop_effects here only
+                # freezes its bloom-disc tracking (see stop_effects' own
+                # docstring); flash/scheduler/rings keep pinging, new
+                # rings included, completely unaffected right through
+                # the slide.
                 stop_effects(next_extras)
-                # current_net's new rings are locked here too -- right
-                # before it fades out for good, same as every other
-                # stop_effects call site -- but its flash/scheduler and
-                # any ring already in flight keep running (see
-                # stop_effects' own docstring), so the outgoing net keeps
-                # pinging, rings included, as it fades instead of visibly
-                # going quiet the moment the incoming net starts sliding.
+                # current_net is about to fade out for good -- same
+                # reasoning, its own pings (new rings included) keep
+                # firing right up until it's gone.
                 stop_effects(current_extras)
                 # The lap right after this one is the final, deliberately-
                 # overflowing net -- centering the composition around it
@@ -2787,11 +2680,10 @@ class RecursiveSelfImprovement(ThreeDScene):
             # The last flat net and its code fade away while the icosahedron
             # is brought to center -- then the camera tilts to reveal it was
             # never flat to begin with, and it spins as the closing shot.
-            # current_net's new rings are locked first (see stop_effects'
-            # own docstring for why) -- its flash/scheduler and any ring
-            # already in flight keep running right through the FadeOut,
-            # so it keeps pinging, rings included, as it fades instead of
-            # going quiet the moment this self.play starts.
+            # stop_effects here only freezes bloom-disc tracking (see its
+            # own docstring) -- flash/scheduler/rings keep pinging, new
+            # rings included, completely unaffected right through the
+            # FadeOut.
             stop_effects(current_extras)
             ico_group = VGroup(ico_glow, ico_vertices, ico_edges)
             self.play(
@@ -2843,12 +2735,11 @@ class RecursiveSelfImprovement(ThreeDScene):
                 # synchronized block, and the backdrop stays put
                 # throughout -- so this reads as the scene's pieces
                 # settling away, not the whole picture (background glow
-                # included) dimming to black. Both nets' new rings are
-                # locked here, right before they fade out for good (see
-                # stop_effects' own docstring) -- their flash/scheduler
-                # and any ring already in flight keep running right
-                # through the FadeOut, so both keep pinging, rings
-                # included, as they fade.
+                # included) dimming to black. stop_effects here only
+                # freezes bloom-disc tracking (see its own docstring) --
+                # both nets' flash/scheduler/rings keep pinging, new
+                # rings included, completely unaffected right through
+                # the FadeOut.
                 stop_effects(current_extras)
                 stop_effects(final_extras)
                 self.play(
