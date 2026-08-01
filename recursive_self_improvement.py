@@ -173,6 +173,20 @@ FINAL_HOLD_SECONDS = float(os.environ.get("FINAL_HOLD_SECONDS", "15") or 15)
 # Implies MAIN_ONLY (mini-movie 1 never runs either way).
 LAP_ONLY = os.environ.get("LAP_ONLY", "0") == "1"
 
+# Set FINAL_GROWIN_ONLY=1 to render *just* the final net's own real
+# grow-in (full detail -- real edges, real node size, nothing shrunk or
+# skipped, unlike CHAIN_TEST) followed by a short hold, and nothing
+# else at all: no earlier net, no code/brace/arrows (not even placed
+# instantly the way LAP_ONLY places its own lead-in -- current_net isn't
+# needed for anything but visually giving the arrow something to point
+# from, and final_net's own position only ever depends on the code's
+# geometry, which code_edges_for already gets without building the real
+# mobject). Implies FINAL_ONLY and MAIN_ONLY. Meant for spot-checking
+# something specific to the grow-in itself -- e.g. whether node flashes
+# glitch right as it completes -- as fast and minimally as possible.
+FINAL_GROWIN_ONLY = os.environ.get("FINAL_GROWIN_ONLY", "0") == "1"
+FINAL_GROWIN_ONLY_HOLD_SECONDS = float(os.environ.get("FINAL_GROWIN_ONLY_HOLD_SECONDS", "1") or 1)
+
 # Set CHAIN_TEST=1 (meant to be combined with FINAL_ONLY) to strip the
 # final lap down to just the final net itself, for the fastest possible
 # look at pulse-chain timing/density with nothing else competing for
@@ -1594,6 +1608,17 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
     # of relying on some later animation to sweep it in.
     scene.add(extras.ring_holder)
 
+    # Stashed on extras (same reasoning as pulse_driver above) so
+    # grow_in can reach it right after this net's own grow-in
+    # self.play() completes, without this closure's own state threaded
+    # through as a parameter -- see refresh_flashes' own docstring for
+    # why that call exists at all.
+    def refresh_flashes():
+        for node_tick in flash_ticks:
+            node_tick(0)
+
+    extras.refresh_flashes = refresh_flashes
+
     # Stashed on extras (same reasoning as pulse_driver above) so a
     # caller about to fade this net out for good can reach it without
     # this closure's own state threaded through as a parameter -- see
@@ -2456,6 +2481,27 @@ class RecursiveSelfImprovement(ThreeDScene):
             top_level.append(AnimationGroup(*edge_fade_ins))
         top_level.append(LaggedStart(*[GrowFromCenter(n) for n in node_list], lag_ratio=0.04))
         self.play(*top_level, run_time=run_time)
+        # Every node's own flash color gets forcibly reset back to
+        # whatever it looked like when this net's grow-in *began*, for
+        # exactly one rendered frame right as it finishes -- confirmed
+        # directly against an actual render: every flash in progress
+        # vanishes in unison on that one frame, then reappears (same
+        # nodes, same colors) the very next one, as if nothing happened.
+        # A GrowFromCenter's own target is the live mobject itself, not
+        # a frozen copy (unlike the slide's own .animate.shift()), so
+        # this isn't the same frozen-snapshot mechanism already fixed
+        # for rings -- more likely manim's moving/static mobject split,
+        # recomputed fresh for every new self.play() call, briefly
+        # treating a node as "static" (and so reusing a cached, pre-
+        # flash frame) right at this exact boundary before the next
+        # self.play's own first real tick sorts it back out. Rather than
+        # chase that mechanism down further, refresh_flashes just
+        # re-asserts each node's own true current color immediately,
+        # synchronously, right here -- before any further rendering can
+        # happen -- the same strategy already used to fix the analogous
+        # ring-fade-out issue, just applied to flashes at grow-in instead
+        # of rings at fade-out.
+        extras.refresh_flashes()
 
     def construct(self):
         # Seeds the *global* random module, not just each net's own
@@ -2496,7 +2542,7 @@ class RecursiveSelfImprovement(ThreeDScene):
         # 2, then a beat of plain blank background as a hard cut between
         # the two, then mini-movie 2 -- the full chain -- runs unchanged.
         try:
-            if not MAIN_ONLY and not FINAL_ONLY and not LAP_ONLY:
+            if not MAIN_ONLY and not FINAL_ONLY and not LAP_ONLY and not FINAL_GROWIN_ONLY:
                 self.construct_intro()
                 if INTRO_ONLY:
                     return
@@ -2604,6 +2650,26 @@ class RecursiveSelfImprovement(ThreeDScene):
         )
 
     def construct_main(self, backdrop):
+        if FINAL_GROWIN_ONLY:
+            # final_net's own position only ever depends on the final
+            # lap's own code block (built at shift=0 -- see the real
+            # final-lap code below for where that comes from), never on
+            # current_net -- code_edges_for gets that same geometry
+            # without building the real code/brace mobjects, so nothing
+            # about current_net, code, brace, or the arrows needs to
+            # exist here at all.
+            code_right_edge, _ = code_edges_for(CODE_STAGE_FINAL)
+            final_vertex_x = right_facing_edge(code_right_edge)
+            final_net, final_nodes, final_edges, final_glow, final_extras = build_net(
+                center=np.array([final_vertex_x, 0, 0]), palette=RED_PALETTE, edge_color=RED_EDGE, **FINAL_STAGE
+            )
+            self.grow_in(
+                final_nodes, final_edges, final_glow, final_extras, FINAL_STAGE["node_radius"], RED_PALETTE,
+                run_time=max(1.3 * FINAL_CODE_MULT, 0.5),
+            )
+            self.hold(FINAL_GROWIN_ONLY_HOLD_SECONDS)
+            return
+
         # Code the *next* lap will show, one entry per lap in order,
         # ending with the final lap's -- known up front since every
         # code block is static content, so a net can be slid straight to
