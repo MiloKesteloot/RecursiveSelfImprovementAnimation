@@ -45,32 +45,41 @@ below), confirm everything's installed correctly with a fast, low-res
 preview of just the opening few seconds:
 
 ```bash
-LOW_RES=1 FAST_PREVIEW=1 DEMO_SECONDS=10 manim -pql recursive_self_improvement.py RecursiveSelfImprovement
+LOW_RES=1 FAST_PREVIEW=1 DEMO_SECONDS=10 python -m manim -pql recursive_self_improvement.py RecursiveSelfImprovement
 ```
 
-(On Windows PowerShell, set each env var on its own line first:
-`$env:LOW_RES=1; $env:FAST_PREVIEW=1; $env:DEMO_SECONDS=10` — then run
-the `manim` command without the leading `VAR=1` prefixes.)
+On Windows PowerShell, set each env var on its own line first, then run
+the command without the leading `VAR=1` prefixes:
+
+```powershell
+$env:LOW_RES=1
+$env:FAST_PREVIEW=1
+$env:DEMO_SECONDS=10
+python -m manim -pql recursive_self_improvement.py RecursiveSelfImprovement
+```
+
+(`python -m manim` is used here instead of the bare `manim` command
+because whether `manim` resolves on its own depends on your system's
+`PATH` — `python -m manim` always works as long as the `pip install`
+above succeeded. If `manim` alone happens to work for you too, either
+form is fine.)
 
 This renders in well under a minute and should pop open a small, rough
 preview. If it runs and plays, your setup is good and you're ready for
-the real render below. If it errors, it's almost always one of: ffmpeg
-not on `PATH`, or the `Consolas` font not found. If the shell says it
-can't find the `manim` command at all, use `python -m manim ...`
-instead (same arguments) — that always works as long as the `pip
-install` above succeeded.
+the real render below. If it errors instead, it's almost always ffmpeg
+not on `PATH`, or the `Consolas` font not found.
 
 ## 4. The full render (4K, 60fps)
 
 ```bash
-UHD_RES=1 manim -qh --disable_caching -o RecursiveSelfImprovement_Final recursive_self_improvement.py RecursiveSelfImprovement
+UHD_RES=1 python -m manim -qh --disable_caching -o RecursiveSelfImprovement_Final recursive_self_improvement.py RecursiveSelfImprovement
 ```
 
 On Windows PowerShell:
 
 ```powershell
 $env:UHD_RES=1
-manim -qh --disable_caching -o RecursiveSelfImprovement_Final recursive_self_improvement.py RecursiveSelfImprovement
+python -m manim -qh --disable_caching -o RecursiveSelfImprovement_Final recursive_self_improvement.py RecursiveSelfImprovement
 ```
 
 **This is a long render — plan for it to run for many hours (quite

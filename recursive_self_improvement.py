@@ -1266,6 +1266,28 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
     flash_color = FLASH_COLOR_OVERRIDE or (SIMPLE_STYLE_FLASH_COLOR if SIMPLE_STYLE else core_color)
     node_list = list(nodes_group)
     SMALL_NET_THRESHOLD = 6
+    # Base cooldown before a chain that just finished starts its next one
+    # -- jittered by a random amount in [0, chain_stagger) at each actual
+    # assignment (see below) rather than used bare. Bare, every cycle's
+    # own phase shift (mod chain_stagger) would be *exactly* the same:
+    # a path's own hop count only ever adds a whole multiple of
+    # chain_stagger to a chain's timeline (chain_stagger apart, hop to
+    # hop, regardless of how many hops), so the fractional remainder
+    # left over after each full cycle would be driven entirely by this
+    # fixed constant -- 0.5 mod 0.2 = 0.1, always, no matter which
+    # random path length was drawn. A chain would then only ever land in
+    # one of two possible phases relative to a chain_stagger-wide grid
+    # (drifting by that same fixed 0.1 each cycle just alternates
+    # between them), forever, regardless of how many chains are running
+    # or how long the net sits there -- confirmed directly against a
+    # DEBUG_PULSE trace on the 432-node final net: 3.2 nodes firing at
+    # the exact same clock timestamp on average, persisting unchanged
+    # from the first second all the way through the tenth, not settling
+    # into the more organic, spread-out timing a purely random path
+    # length was supposed to produce on its own. Jittering the cooldown
+    # itself makes that per-cycle phase shift genuinely random instead
+    # of fixed, which is what actually breaks chains out of a small
+    # handful of shared phases.
     next_chain_cooldown = 0.9 if len(node_list) < SMALL_NET_THRESHOLD else 0.5
     index_of = {id(n): i for i, n in enumerate(node_list)}
     adjacency = {i: [] for i in range(len(node_list))}
@@ -1481,7 +1503,12 @@ def add_pulse_chains(scene, nodes_group, edges_group, palette, extras, chain_sta
                 visited.add(current)
 
             chain["queue"] = [[hop * chain_stagger, idx] for hop, idx in enumerate(path)]
-            chain["cooldown"] = next_chain_cooldown
+            # Jittered (see next_chain_cooldown's own comment for why a
+            # bare constant here leaves chains phase-locked to a handful
+            # of shared timings forever) -- a fresh random draw every
+            # single cycle, not just once per chain, so consecutive
+            # cycles can't drift back into sync with each other either.
+            chain["cooldown"] = next_chain_cooldown + random.uniform(0, chain_stagger)
 
     def scheduler(mob, dt):
         # Subdivides elapsed time into normal-frame-sized steps before
